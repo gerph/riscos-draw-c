@@ -1,0 +1,113 @@
+/*******************************************************************
+ * File:        main
+ * Purpose:     DrawFlattening command line tool
+ * Author:      YOUR NAME
+ ******************************************************************/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+
+#include "VersionNum"
+
+#include "types.h"
+
+int32_t in_buffer[256];
+int32_t out_buffer[256];
+
+#define FLATTENING (16)
+
+
+void show_path(Draw_PathElement *path)
+{
+    while (path->tag != Draw_EndPath)
+    {
+        switch (path->tag)
+        {
+            case Draw_MoveTo:
+                printf("MoveTo &%06x, &%06x\n", path->data.move_to.x, path->data.move_to.y);
+                path = (Draw_PathElement *)(((int32_t*)path) + 3);
+                break;
+
+            case Draw_LineTo:
+                printf("LineTo &%06x, &%06x\n", path->data.line_to.x, path->data.line_to.y);
+                path = (Draw_PathElement *)(((int32_t*)path) + 3);
+                break;
+
+            case Draw_BezierTo:
+                printf("BezierTo &%06x, &%06x ; &%06x, &%06x ; &%06x, &%06x\n",
+                       path->data.bezier_to[0].x, path->data.bezier_to[0].y,
+                       path->data.bezier_to[1].x, path->data.bezier_to[1].y,
+                       path->data.bezier_to[2].x, path->data.bezier_to[2].y);
+                path = (Draw_PathElement *)(((int32_t*)path) + 7);
+                break;
+
+            case Draw_EndPath:
+                /* Already handled in the while */
+                printf("End of path\n");
+                return;
+
+            default:
+                printf("Unrecognised tag %i\n", path->tag);
+                exit(1);
+        }
+    }
+}
+
+
+void test_flattening(void)
+{
+    Draw_PathElement *inpath = (Draw_PathElement *)in_buffer;
+    Draw_PathElement *outpath = (Draw_PathElement *)out_buffer;
+#define ADD_MOVE(_path, _x,_y) do { _path->tag = Draw_MoveTo; \
+                                    _path->data.move_to.x = _x; \
+                                    _path->data.move_to.y = _y; \
+                                    _path = (Draw_PathElement *)(((int32_t*)_path) + 3); \
+                               } while(0)
+#define ADD_LINE(_path, _x,_y) do { _path->tag = Draw_LineTo; \
+                                    _path->data.line_to.x = _x; \
+                                    _path->data.line_to.y = _y; \
+                                    _path = (Draw_PathElement *)(((int32_t*)_path) + 3); \
+                               } while(0)
+#define ADD_BEZIER(_path, _c1x,_c1y,_c2x,_c2y, _endx, _endy) \
+                        do { _path->tag = Draw_BezierTo; \
+                             _path->data.bezier_to[0].x = _c1x; \
+                             _path->data.bezier_to[0].y = _c1y; \
+                             _path->data.bezier_to[1].x = _c2x; \
+                             _path->data.bezier_to[1].y = _c2y; \
+                             _path->data.bezier_to[2].x = _endx; \
+                             _path->data.bezier_to[2].y = _endy; \
+                             _path = (Draw_PathElement *)(((int32_t*)_path) + 7); \
+                        } while(0)
+#define ADD_END(_path, space) do { _path->tag = Draw_EndPath; \
+                                   _path->data.end_path = space; \
+                                   _path = (Draw_PathElement *)(((int32_t*)_path) + 2); \
+                              } while(0)
+
+    ADD_MOVE(inpath, 0x8000, 0x8000);
+    ADD_LINE(inpath, 0xC000, 0x8000); /* Bottom right */
+    ADD_LINE(inpath, 0xC000, 0xC000); /* Top right */
+    ADD_BEZIER(inpath, 0xA000, 0xC000,
+               0x8000, 0xA000,
+               0x8000, 0x8000); /* Curve to bottom left */
+    ADD_END(inpath, 0);
+
+    inpath = (Draw_PathElement *)in_buffer;
+    /* The in_buffer now contains a simple curved corner */
+
+    ADD_END(outpath, sizeof(out_buffer) - sizeof(int32_t)*2);
+    outpath = (Draw_PathElement *)out_buffer;
+    /* The out_buffer now contains a single 'END' which contains the length of the data */
+
+    flatten(inpath, outpath, FLATTENING);
+
+    show_path(outpath);
+}
+
+int main(int argc, char *argv[])
+{
+    printf("DrawFlattening " Module_FullVersionAndDate "\n");
+    test_flattening();
+
+    exit(EXIT_SUCCESS);
+}

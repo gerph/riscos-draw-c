@@ -1,0 +1,1683 @@
+<?xml version="1.0"?>
+<!DOCTYPE riscos-prm PUBLIC "-//Gerph//DTD PRM documentation 1.03//EN"
+                            "http://gerph.org/dtd/103/prm.dtd">
+
+<riscos-prm>
+
+<!-- Document declares itself as RISC&nbsp;OS PRMs: Volume 3: Chapter 63: Draw module -->
+
+<chapter title="Draw module">
+
+<section title="Introduction">
+
+<p>The Draw module is an implementation of PostScript type drawing. A
+collection of moves, lines, and curves in a user-defined coordinate system
+are grouped together and can be manipulated as one object, called a
+path.</p>
+
+<p>A path can be manipulated in memory or upon writing to the VDU. There is
+full control over the following characteristics of the path:</p>
+
+<p>
+<list>
+<item><p>rotation, scaling and translation of the path</p></item>
+
+<item><p>thickness of a line</p></item>
+
+<item><p>description of dots and dashes for a line</p></item>
+
+<item><p>joins between lines can be mitred, round or bevelled</p></item>
+
+<item><p>the leading or trailing end of a line, or dot (which are in fact
+just very short dashes), can be butt, round, a projecting square or
+triangular (used for arrows)</p></item>
+
+<item><p>filling of arbitrary shapes</p></item>
+
+<item><p>what the fill considers to be interior</p></item>
+
+</list>
+</p>
+
+<p>A path can be displayed in many different ways. For example, if you write
+a path that draws a petal, and draw it several times rotating about a point,
+you will have a flower. This uses only one of the characteristics that you
+can control.</p>
+
+<p>The Draw application was written using this module, and this is the kind
+of application that it is suited to. It is advisable to read the section on
+Draw in the <em>User Guide</em> to familiarise yourself with some of the properties
+of the Draw module.</p>
+
+</section>
+
+
+<section title="Overview">
+
+<subsection title="Definition of terms">
+
+<p>There are many specialised terms used within the Draw module. Here are
+the most important ones. If you are familiar with PostScript, then many of
+these should be the same.</p>
+
+
+<p>
+<definition-table>
+<definition name="Path element">is a sequence of words. The first word in the
+sequence has a command number, called the <em>element type</em>, in the bottom
+byte. Following this are parameters for that element type</definition>
+
+<definition name="Subpath">is a sequence of path elements that defines a
+single connected polygon or curve. The ends of the subpath may be connected,
+so it forms a loop (in which case it is said to be <em>closed</em>) or may be
+<em>loose ends</em> (in which case it is said to be <em>open</em>). A subpath
+can cross itself or other subpaths in the same path.</definition>
+
+<definition name="Path">is a sequence of subpaths and path elements.</definition>
+
+<definition name="Bezier curve">is a type of smooth curve connecting two
+<em>endpoints</em>, with its direction and curvature controlled by two
+<em>control points</em>.</definition>
+
+<definition name="Flattening">is the process of converting a Bezier curve into
+a series of small lines when outputting.</definition>
+
+<definition name="Flatness">is how closely the lines will approximate the original Bezier curve.</definition>
+
+<definition name="Transformation&nbsp;matrix">is the standard mathematical tool
+for two-dimensional transformations using a three by three array. It can
+rotate, scale and translate (move).</definition>
+
+<definition name="Stroke">means to draw a thickened line centred on a
+path.</definition>
+
+<definition name="Gap">is effectively a transparent line segment in a
+subpath. If the subpath is stroked, the piece around the gap will not be
+plotted. Gaps are used by Draw to implement dashed lines.</definition>
+
+<definition name="Line caps">are placed at the ends of an open subpath and at
+the ends of dashes in a dashed line when they are stroked. They can be
+<em>butt</em>, <em>round</em>, a <em>projecting square</em> or
+<em>triangular</em>.</definition>
+
+<definition name="Joins">occur between adjacent lines, and between the start
+and end of a closed subpath. They can be <em>mitred</em>, <em>round</em> or
+<em>bevelled</em>.</definition>
+
+<definition name="Fill">means to draw everything inside a path.</definition>
+
+<definition name="Interior">pixels are ones that are filled.</definition>
+
+<definition name="Exterior">pixels are not filled.</definition>
+
+<definition name="Winding number rule">is the rule for deciding what is
+interior or exterior to a path when filling. The interior parts are those
+that are filled.</definition>
+
+<definition name="Boundary">pixels are those that would be drawn if the line
+were stroked with minimum thickness for the VDU.</definition>
+
+<definition name="Thickening">a path is converting it to the required thickness
+- that is generating a path which, if filled, would produce the same results
+as stroking the original path.</definition>
+
+</definition-table>
+</p>
+
+</subsection>
+
+<subsection title="Scaling systems">
+
+<p>This is an area where you must take great care when using the Draw
+module, because four different systems are used in different places.</p>
+
+<subsubsection title="OS units">
+
+<p>OS units are notionally 1/180<sup>th</sup> of an inch, and are the standard units
+used by the VDU drivers for specifying output to the screen.</p>
+
+<p>This coordinate system is (not surprisingly) what the Draw module uses
+when it strokes a path onto the screen.</p>
+
+</subsubsection>
+
+<subsubsection title="Internal Draw units">
+
+<p>Internally, Draw uses a coordinate system the units of which are 1/256<sup>th</sup>
+of an OS unit. We shall call these internal Draw units.</p>
+
+<p>In a 32 bit internal Draw number, the top 24 bits are the number of OS
+units, and the bottom 8 bits are the fraction of an OS unit.</p>
+
+<p>
+<bitfield-table>
+<bit number="0-7">Fraction of an OS unit</bit>
+<bit number="8-31">Number of OS units</bit>
+</bitfield-table>
+</p>
+
+</subsubsection>
+
+
+<subsubsection title="User units">
+
+<p>The coordinates used in a path can be in any units that you wish to use.
+These are converted by the transformation matrix into internal Draw units
+when generating output.</p>
+
+<p>Note that because it is a fixed point system, scaling problems can occur
+if the user units differ too much from the internal Draw units. Because of
+this problem, you are limited in the range of user units that you can
+use.</p>
+
+</subsubsection>
+
+
+<subsubsection title="Transform units">
+
+<p>Transform units are only used to specify some numbers in the
+transformation matrix. They divide a word into two parts: the top two bytes
+are the integer part, and the bottom two bytes are the fraction part.</p>
+
+<p>
+<bitfield-table>
+<bit number="0-15">Fraction part</bit>
+<bit number="16-31">Integer part</bit>
+</bitfield-table>
+</p>
+
+</subsubsection>
+
+</subsection>
+
+
+<subsection title="Transformation matrix">
+
+<p>This is a three by three matrix that can be used to rotate, scale or
+translate a path in a single operation.</p>
+
+</subsection>
+
+
+<subsection title="Winding rules">
+
+<p>The winding rule determines what the Draw module considers to be
+interior, and hence filled.</p>
+
+<!-- errata -->
+<p>Even-odd means that an area is filled if a ray from that area to outside
+the path's bounding box crosses an odd number of paths.</p>
+
+<!-- errata -->
+<p>Non-zero winding fills areas on the basis of the direction in which the
+subpaths which surround the area were constructed. If an equal number of
+subpaths in each direction surround the area, it is not filled, otherwise it
+is.</p>
+
+<p>The positive winding rule will fill an area if it is surrounded by more
+anti-clockwise subpaths than clockwise. The negative winding rule works in
+reverse to this.</p>
+
+<p>Even-odd and non-zero winding are printer driver compatible, whereas the
+other two are not. If you wish to use the path with a printer driver, then
+bear this in mind.</p>
+
+</subsection>
+
+
+
+
+<subsection title="Stroking and filling">
+
+<p>Flattening means bisecting any Bezier curves recursively until each of
+the resulting small lines lies within a specified distance of the curve.
+This distance is called flatness. The longer this distance, the more obvious
+will be the straight lines that approximate the curve.</p>
+
+<p>All moving and drawing is relative to the VDU graphics origin, as set by
+<command>VDU 29, x; y;</command> (see <reference type="vdu" name="29" href="../kernel/io/vducodes" />).</p>
+
+<p>None of the Draw SWIs will plot outside the boundaries of the VDU
+graphics window, as set by <command>VDU 24, l; b; r; t;</command> (see <reference type="vdu" name="24" href="../kernel/io/vducodes" />).</p>
+
+<p>All calls use the colour (both pixel pattern and operation) set up for
+the <reference type="chapter" name="VDU drivers" href="vdudrivers">VDU driver</reference>. Note that not all such colours are compatible with printer
+drivers.</p>
+
+</subsection>
+
+
+
+<subsection title="Printing">
+
+<p>If your program needs to generate printer output, then it is very
+important that you read the chapter entitled <reference type="chapter" name="Printing a document from an application" href="../printing/printdoc" />, specifically the sections entitled <reference type="subsection" name="Guidelines on output calls to use" href="../printing/printdoc" /> and <reference type="subsection" name="DrawV" href="../printing/printdoc" />. The Draw SWIs that
+are affected by printing have comments in them about the limitations and
+effects.</p>
+
+</subsection>
+
+
+
+<subsection title="Floating point">
+
+<p>SWI numbers and names have been allocated to support floating point Draw
+operations. In fact for every SWI described in this chapter, there is an
+equivalent one for floating point - <strong>just add FP to the end of each name</strong>.</p>
+
+<p>The floating point numbers used in the specification are IEEE single
+precision floating point numbers.</p>
+
+<p>They may be supported in some future version of RISC&nbsp;OS, but if you try
+to use them in current versions you'll get an error back.</p>
+</subsection>
+</section>
+
+
+
+<section title="Technical details">
+
+<subsection title="Data structures">
+
+<p>Many common structures are used by Draw module SWIs. Rather than
+duplicate the descriptions of these in each SWI, they are given here. Some
+SWIs have small variations which are described with the SWI.</p>
+
+<subsubsection title="Path">
+
+<p>The path structure is a sequence of subpaths, each of which is a sequence
+of elements. Each element is from one to seven words in length. The lower
+byte of the first word is the element type. The remaining three bytes of it
+are free for client use. On output to the input path the Draw module will
+leave these bytes unchanged. However, on output to a standard output path
+the Draw module will store zeroes in these three bytes.</p>
+
+<p>The element type is a number from 0 to 8 that is followed by the
+parameters for the element, each a word long. The path elements are as
+follows:</p>
+
+<p>
+<value-table head-number="Element type" head-name="Parameters">
+
+<value number="0" name="n">End of path. n is ignored when reading the path, but is used to check space when reading and writing a path.</value>
+
+<value number="1" name="ptr">Pointer to continuation of path. ptr is the address of the first path element of the continuation.</value>
+
+<value number="2" name="x y">Move to (x, y) starting new subpath. The new subpath <strong>does</strong> affect winding numbers and so is filled normally. This is the normal way to start a new subpath.</value>
+
+<value number="3" name="x y">Move to (x, y) starting new subpath. The new subpath <strong>does not</strong> affect winding numbers when filling. This is mainly for internal use and rarely used by applications.</value>
+
+<value number="4" name="">Close current subpath with a gap.</value>
+
+<value number="5" name="">Close current subpath with a line. It is better to use one of these two to close a subpath than 2 or 3, because this guarantees a closed subpath.</value>
+
+<value number="6" name="x1 y1 x2 y2 x3 y3">Bezier curve to (x3, y3) with control points at (x1, y1) and (x2, y2).</value>
+
+<value number="7" name="x y">Gap to (x, y). Do not start a new subpath. Mainly for internal use in dot-dash sequences.</value>
+
+<value number="8" name="x y">Line to (x, y).</value>
+
+</value-table>
+</p>
+
+<p>You will notice that there are some order constraints on these element
+types:</p>
+
+<p>
+<list>
+<item><p>path elements 2 and 3 start new subpaths</p></item>
+
+<item><p>path elements 6, 7 and 8 may only appear while there is a current
+subpath</p></item>
+
+<item><p>path elements 4 and 5 may only appear while there is a current
+subpath, and end it, leaving no current subpath</p></item>
+
+<item><p>path elements 2 and 3 can also be used to close the current subpath
+(which is a part of starting a new subpath).</p></item>
+
+</list>
+</p>
+
+</subsubsection>
+
+
+
+<subsubsection title="Open and closed subpaths">
+
+<p>When you are stroking (using <reference type="swi" name="Draw_Stroke" />), if a subpath ends with a 4 or
+5 then it is closed, and the ends are joined - whereas a 2 or 3 leaves a
+subpath open, and the loose ends are capped. These four path elements
+explicitly leave a stroked subpath either open or closed.</p>
+
+<p>Some other operations implicitly close open subpaths, and this will be
+stated in their descriptions.</p>
+
+<p>Just because the ends of a subpath have the same coordinates, that
+doesn't mean the subpath is closed. There is no reason why the loose ends of
+an open subpath cannot be coincident.</p>
+
+</subsubsection>
+
+
+
+<subsubsection title="Output path">
+
+<p>After a SWI has written to an output path, it is identical to an <reference type="subsubsection" name="path">input
+path</reference>. When it is first passed to the SWI as a parameter, the start of the
+block pointed to should contain an element type zero (end of path) followed
+by the number of available bytes. This is so that the Draw module will not
+accidentally overrun the buffer.</p>
+
+</subsubsection>
+
+
+<subsubsection title="Fill style">
+
+<p>The fill style is a word that is passed in a call to <reference type="swi" name="Draw_Fill" />,
+<reference type="swi" name="Draw_Stroke" />, <reference type="swi" name="Draw_StrokePath" /> or <reference type="swi" name="Draw_ProcessPath" />. It is a bitfield, and all
+of the calls use at least the following common states. See the description
+of each call for differences from this:</p>
+
+<p>
+<bitfield-table>
+<bit number="0-1">Winding number rule:
+<value-table>
+<value number="0">Non-zero winding number rule</value>
+<value number="1">Negative winding number rule</value>
+<value number="2">Even-odd winding number rule</value>
+<value number="3">Positive winding number rule</value>
+</value-table>
+</bit>
+
+<bit number="2" state="clear">Do not plot non-boundary exterior pixels</bit>
+<bit number="2" state="set">Plot non-boundary exterior pixels</bit>
+
+<bit number="3" state="clear">Do not plot boundary exterior pixels</bit>
+<bit number="3" state="set">Plot boundary exterior pixels</bit>
+
+
+<bit number="4" state="clear">Do not plot boundary interior pixels</bit>
+<bit number="4" state="set">Plot boundary interior pixels</bit>
+
+<bit number="5" state="clear">Do not plot nonboundary interior pixels.</bit>
+<bit number="5" state="set">Plot non-boundary interior pixels.</bit>
+
+
+<bit number="6-31" state="reserved" />
+</bitfield-table>
+</p>
+
+
+</subsubsection>
+
+
+<subsubsection title="Transformation matrix">
+
+<p>This is a three by three matrix that can be used to rotate, scale or translate a path in a single operation. It is laid out like this:</p>
+
+<p><image type="png" src="draw_matrix.png" /></p>
+
+<category title="Transformations">
+
+<p>The common transformations can all be easily done with this matrix:</p>
+
+<p>
+<list>
+
+<item><p>Translation by a given displacement is done by <variable>e</variable> for the x axis</p></item>
+
+<item><p>Translation by a given displacement is done by <variable>f</variable> for the y axis</p></item>
+
+<item><p>Transforms a coordinate (x, y) into another coordinate (x', y') as follows:<br />
+x' = ax + cy + e<br />
+y' = bx + dy + f
+</p></item>
+
+<item><p>Scaling the x axis uses <variable>a</variable></p></item>
+
+<item><p>Scaling the y axis uses <variable>d</variable></p></item>
+
+<item><p>Rotation can be performed by setting:
+
+<list>
+<item><p><variable>a</variable> = cos(&#952;)</p></item>
+
+<item><p><variable>b</variable> = sin(&#952;)</p></item>
+
+<item><p><variable>c</variable> = –sin(&#952;)</p></item>
+
+<item><p><variable>d</variable> = cos(&#952;)</p></item>
+
+<item><p>&#952; = angle of rotation.</p></item>
+
+</list>
+</p></item>
+
+</list>
+</p>
+
+</category>
+
+<category title="Matrix elements">
+
+<p>Each matrix element is detailed as follows:</p>
+
+<p>
+<definition-table head-name="Matrix element" head-extra="Unit" head-value="Meaning">
+<definition name="a" extra="Transform&nbsp;unit">x scale factor, or cos(&#952;) to rotate</definition>
+
+<definition name="b" extra="Transform unit">sin(&#952;) to rotate</definition>
+
+<definition name="c" extra="Transform unit">-sin(&#952;) to rotate</definition>
+
+<definition name="d" extra="Transform unit">y scale factor, or cos(&#952;) to rotate</definition>
+
+<definition name="e" extra="Draw unit">x translation <sup>[1]</sup></definition>
+
+<definition name="f" extra="Draw unit">y translation <sup>[1]</sup></definition>
+
+</definition-table>
+</p>
+
+<p>[1] If transform units were to be used for these coefficients, then the maximum displacement would only be 256 OS units, which is not very far on the screen.</p>
+
+</category>
+
+<category title="Matrix block">
+
+<p>The matrix is passed as pointer to a six word block, in the order <variable>a</variable>, <variable>b</variable>,
+<variable>c</variable>, <variable>d</variable>, <variable>e</variable>, and <variable>f</variable> as described above. That is:</p>
+
+<p>
+<offset-table head-name="Element" head-value="Meaning">
+<offset number="0" name="a">x scale factor, or cos(&#952;) to rotate</offset>
+
+<offset number="4" name="b">sin(&#952;) to rotate</offset>
+
+<offset number="8" name="c">-sin(&#952;) to rotate</offset>
+
+<offset number="12" name="d">y scale factor, or cos(&#952;) to rotate</offset>
+
+<offset number="16" name="e">x translation</offset>
+
+<offset number="20" name="f">y translation</offset>
+</offset-table>
+</p>
+
+<p>If the pointer to the transformation block is zero, then the <em>identity matrix</em> is assumed - no
+transformation takes place.</p>
+
+<p>Remember that elements <variable>a</variable> - <variable>d</variable> are in <reference type="subsubsection" name="Transform units" />, while <variable>e</variable>
+and <variable>f</variable> are in <reference type="subsubsection" name="internal Draw units" />.</p>
+
+</category>
+
+<category title="Example">
+
+<p>For example plotting with the following:</p>
+
+<p>
+<list>
+<item><p>a scale factor of 1 (&hex;1000 <reference type="subsubsection" name="Transform units" />)</p></item>
+<item><p>a translation of (64, 32) (&hex;4000, &hex;2000 <reference type="subsubsection" name="internal Draw units" />)</p></item>
+<item><p>no rotation required</p></item>
+</list>
+</p>
+
+<p>Would use the values as shown below:</p>
+
+<p>
+<offset-table head-name="Element">
+<offset number="0" name="a">&hex;1000 (x scale factor)</offset>
+
+<offset number="4" name="b">0 (+sin rotation)</offset>
+
+<offset number="8" name="c">0 (-sin rotation)</offset>
+
+<offset number="12" name="d">&hex;1000 (y scale factor)</offset>
+
+<offset number="16" name="e">&hex;4000 (x translation)</offset>
+
+<offset number="20" name="f">&hex;2000 (y translation)</offset>
+</offset-table>
+</p>
+
+</category>
+
+</subsubsection>
+
+
+<subsubsection title="Flatness">
+
+<p>Flatness is the maximum distance that a line is allowed to be from a
+Bezier curve when flattening it. It is expressed in user units. So a smaller
+flatness will result in a more accurate rendering of the curve, but take
+more time and space. For very small values of flatness, it is possible to
+cause the <systemoutput>No room in RMA</systemoutput> error.</p>
+
+<p>A recommended range for flatness is between half and one pixel. Any less
+than this and you're wasting time; any more than this and the curve becomes
+noticeably jagged. A good starting point is:</p>
+
+<p>
+<code type="pseudo">flatness = number of user units in x axis / number of
+pixels in x axis</code>
+</p>
+
+<p>
+<value-table>
+<value number="0">Use the default flatness. This is set to a useful
+value that balances speed and accuracy when stroking to the VDU using the
+default scaling</value>
+<value number="&gt;0">flatness value (can be calculated using the above formula)</value>
+</value-table>
+</p>
+
+<p>Note that if you are going to send a path to a high resolution printer,
+then you may have to set a smaller flatness to avoid jagged curves.</p>
+
+</subsubsection>
+
+
+<subsubsection title="Line thickness">
+
+<p>The line thickness is in user coordinates.</p>
+
+<p>
+<value-table>
+<value number="0">the line is drawn with the minimum
+width that can be used, given the limitations of the pixel size (so lines
+are a single pixel wide).</value>
+<value number="n">the line will be drawn with a thickness of <em>n</em>/2 user coordinates translated to pixels on either side of the theoretical line position.</value>
+</value-table>
+</p>
+
+<p>If the line thickness is non-zero, then the cap and join parameter 
+must also be passed.</p>
+
+
+</subsubsection>
+
+
+<subsubsection title="Cap and join">
+
+<p>The cap and join styles are each passed as a pointer to a four word
+block. A pointer of zero can be passed if cap and join are ignored (as they
+are for zero thickness lines). The block is structured as follows:</p>
+
+<p>
+<offset-table>
+<offset number="0" data-size="4">Join and cap style:
+<bitfield-table>
+<bit number="0-7">Join style:
+<value-table>
+<value number="0">Mitred joins</value>
+<value number="1">Round joins</value>
+<value number="2">Bevelled joins</value>
+</value-table>
+</bit>
+
+<bit number="8-15">Leading cap style:
+<value-table>
+<value number="0">Butt caps</value>
+<value number="1">Round caps</value>
+<value number="2">Projecting square caps</value>
+<value number="3">Triangular caps</value>
+</value-table>
+</bit>
+
+<bit number="16-23">Trailing cap style:
+<value-table>
+<value number="0">Butt caps</value>
+<value number="1">Round caps</value>
+<value number="2">Projecting square caps</value>
+<value number="3">Triangular caps</value>
+</value-table>
+</bit>
+
+<bit number="24-31" state="reserved" />
+</bitfield-table>
+</offset>
+
+<offset number="4" data-size="4">Mitred joins (must be set if using them):
+<bitfield-table>
+<bit number="0-15">Fractional part of mitre limit for mitre joins</bit>
+<bit number="16-31">Integer part of mitre limit for mitre joins</bit>
+</bitfield-table>
+</offset>
+
+<offset number="8" data-size="4">Leading triangular cap size:
+<bitfield-table>
+<bit number="0-15">Cap width on each side (in 256<sup>ths</sup> of line widths, so &hex;0100 is 1 linewidth)</bit>
+<bit number="16-31">Cap length away from the line, in the same measurements as above</bit>
+</bitfield-table>
+</offset>
+
+<offset number="12" data-size="4">Trailing triangular cap size:
+<bitfield-table>
+<bit number="0-15">Cap width on each side (in 256<sup>ths</sup> of line widths, so &hex;0100 is 1 linewidth)</bit>
+<bit number="16-31">Cap length away from the line, in the same measurements as above</bit>
+</bitfield-table>
+</offset>
+
+</offset-table>
+</p>
+
+<p>The mitre limit is a little more complex than the others, so it is
+explained here rather than above. At any given corner, the mitre length is
+the distance from the point at which the inner edges of the stroke meet, to
+the point where the outer edges of the stroke meet. This distance increases
+as the angle between the lines decreases. If the ratio of the mitre length
+to the line width exceeds the mitre limit, stroke treats the corner with a
+bevel join instead of a mitre join. Also see the notes on scaling, later in
+this section.</p>
+
+<p>Under RISC&nbsp;OS 2, the mitre limit is treated as unsigned. It is now
+treated as signed, but must be positive (ie &le; &hex;7FFFFFFF).</p>
+
+<p>Note that words at offsets 4, 8, and 12 are only used if the appropriate
+style is selected by the earlier parts. The structure can therefore be made
+shorter if triangular caps and mitres are not used.</p>
+
+</subsubsection>
+
+
+<subsubsection title="Dash pattern">
+
+<p>The dash pattern is passed as a pointer to a block, the size of which is
+defined at the start, as follows:</p>
+
+<p>
+<offset-table>
+<offset number="0" data-size="4">Distance into dash pattern to start in user coordinates</offset>
+
+<offset number="4" data-size="4">Number of elements in the dash pattern (where <userreplace>n</userreplace> is the number of elements)</offset>
+<offset number="8" data-size="4n+4">Elements in the dash pattern, each of which is a distance in user coordinates</offset>
+</offset-table>
+</p>
+
+<p>Again the pointer can be zero, which implies that continuous lines are
+drawn.</p>
+
+<p>Each element specifies a distance to draw in the present state. The
+pattern starts with the draw on, and alternates off and on for each
+successive element. If it reaches the end of the pattern while drawing the
+line, then it will restart at the beginning.</p>
+
+<p>If <userreplace>n</userreplace> is odd, then the elements will alternate on or off with each
+pass through the pattern: so the first element will be on the first pass,
+off the second pass, on the third pass, and so on.</p>
+
+</subsubsection>
+</subsection>
+
+
+
+<subsection title="Scaling">
+
+<p>The Draw module uses fixed point arithmetic for speed. The number
+representations used are chosen to keep rounding errors small enough not to
+be noticeable.</p>
+
+<p>However, if you use the <reference type="subsubsection" name="transformation matrix" /> to scale a path up a great
+deal, you will also scale up the rounding errors and make them visible.</p>
+
+<p>To avoid such problems, we recommend that you don't use scale factors of
+more than 8 when converting from User units to <reference type="subsubsection" name="internal Draw units" />. (This
+maximum recommended scale factor of 8 is &hex;80000 in the <reference type="subsubsection" name="Transform units" />
+used in the transformation matrix.)</p>
+
+</subsection>
+
+
+
+<subsection title="Draw SWIs">
+
+<p>Though there are a number of SWIs, they all call <reference type="swi" name="Draw_ProcessPath" />.
+Because this takes so many parameters, the other SWIs are provided as an
+easy way of using its functionality.</p>
+
+<p>There are two that output to the VDU:</p>
+
+<p>
+<list>
+<item><p><reference type="swi" name="Draw_Stroke" /> emulates the PostScript
+stroke function and will draw a path onto the VDU.</p></item>
+
+<item><p><reference type="swi" name="Draw_Fill" /> acts like the
+fill function and fills the inside of a path. It is likely that most
+applications will only use these two SWIs.</p></item>
+
+</list>
+</p>
+
+<p>The others are shortcuts for processing a path in one way or other:</p>
+
+<p>
+<list>
+<item><p><reference type="swi" name="Draw_StrokePath" /> acts exactly like Draw_Stroke, except it puts its output
+into a path rather than onto the VDU. Filling its output path produces the
+same results as stroking its input path.</p></item>
+
+<item><p><reference type="swi" name="Draw_FlattenPath" /> will handle only
+the flattening of a path, writing its output to a path.</p></item>
+
+<item><p><reference type="swi" name="Draw_TransformPath" /> will only use the matrix on a path.</p></item>
+
+</list>
+</p>
+
+<p>All these processing
+SWIs are useful when a path will be sent to the VDU many times. If the path
+is flattened or transformed before the stroking, then it will be done
+faster.</p>
+
+</subsection>
+
+
+
+<subsection title="Printer drivers">
+
+<p>If you are using a printer driver, you should note that it cannot deal
+with all calls to the Draw module. As a general rule, you should avoid the following features:</p>
+
+<p>
+<list>
+<item><p>AND, OR, etc operations on colours when writing to the screen.</p></item>
+
+<item><p>Choice of fill style: eg fill excluding/including boundary, fill exterior, etc.</p></item>
+
+<item><p>Positive and negative winding number rules.</p></item>
+
+<item><p>Line cap enhancements, particularly differing leading and trailing caps and triangular caps.</p></item>
+
+</list>
+</p>
+
+<p>The printer driver will also intercept <reference type="vector" name="DrawV" href="../overview/softwarevectors" /> vector and modify how parts of the
+Draw module work. Here is a list of the effects that are common to all the
+SWIs that output to the VDU normally:</p>
+
+<p>
+<list>
+<item><p>cannot deal with positive or negative winding numbers</p></item>
+
+<item><p>cannot fill:
+<list type="ordered">
+<item><p>non-boundary exterior pixels</p></item>
+<item><p>exterior boundary pixels only</p></item>
+<item><p>interior boundary pixels only</p></item>
+<item><p>exterior boundary and interior non-boundary pixels</p></item>
+</list>
+</p></item>
+
+<item><p>an application should not rely on any difference between the following fill states:
+<list type="ordered">
+<item><p>interior non-boundary pixels only</p></item>
+<item><p>all interior pixels</p></item>
+<item><p>all interior pixels and exterior boundary pixels</p></item>
+</list>
+</p></item>
+
+</list>
+</p>
+
+<p>Further information on this topic is available in the chapter entitled <reference type="chapter" name="Printing a document from an application" href="../printing/printdoc" />, specifically the sections entitled <reference type="subsection" name="Guidelines on output calls to use" href="../printing/printdoc" /> and <reference type="subsection" name="DrawV" href="../printing/printdoc" />.</p>
+
+</subsection>
+
+</section>
+
+
+
+<section title="SWI calls">
+
+<swi-definition name="Draw_ProcessPath"
+                number="40700"
+                description="Main Draw SWI"
+                irqs="enabled"
+                fiqs="enabled"
+                processor-mode="SVC"
+                re-entrant="no">
+
+<entry>
+<register-use number="0">pointer to <reference type="subsubsection" name="path">input path</reference> buffer (see below)</register-use>
+
+<register-use number="1"><reference type="subsubsection" name="fill style" />:
+<bitfield-table>
+<bit number="0-5">Common <reference type="subsubsection" name="fill style" /> bits</bit>
+<bit number="6-26" state="reserved" />
+<bit number="27">Open subpaths are to be closed</bit>
+<bit number="28">Path is to be flattened</bit>
+<bit number="29">Path is to be thickened</bit>
+<bit number="30">Path is to be re-flattened after thickening</bit>
+<bit number="31">Floating point output (not implemented)</bit>
+</bitfield-table>
+</register-use>
+
+<register-use number="2">pointer to <reference type="category" name="Matrix block" >transformation matrix block</reference>, or:
+<value-table>
+<value number="0">Identity matrix (no transformation)</value>
+</value-table>
+</register-use>
+
+<register-use number="3"><reference type="subsubsection" name="flatness" />, or:
+<value-table>
+<value number="0">Default</value>
+</value-table>
+</register-use>
+
+<register-use number="4"><reference type="subsubsection" name="line thickness" />, or:
+<value-table>
+<value number="0">Default</value>
+</value-table>
+</register-use>
+
+<register-use number="5">pointer to <reference type="subsubsection" name="Cap and join">line cap and join</reference> specification (if required)</register-use>
+
+<register-use number="6">pointer to <reference type="subsubsection" name="dash pattern" />, or:
+<value-table>
+<value number="0">No dashes</value>
+</value-table>
+</register-use>
+
+<register-use number="7">pointer to <reference type="subsubsection" name="Output path">output path</reference> buffer, or:
+<value-table>
+<value number="0">Output to the input path buffer. Only valid if the input path's length (ie storage requirement) does not change during the call, such as when doing a transformation only.</value>
+<value number="1">Fill the path normally.</value>
+<value number="2">Fill the path, subpath by subpath. (<reference type="swi" name="Draw_Stroke" /> will often use this to economise on RMA usage).</value>
+<value number="3">Count how large an output buffer is required for the given path and actions.</value>
+<value number="&hex;80000000+pointer">Output the path's bounding box, in transformed coordinates. The buffer will contain the four words: low x, low y, high x, high y.</value>
+<value number="pointer">Output to a specified output buffer.<br />
+The length of the buffer must be indicated by putting a suitable path element 0 at the start of the buffer, and a pointer to the new path element 0 is returned in R0 to allow you to append to the output path.
+</value>
+</value-table>
+</register-use>
+</entry>
+
+<exit>
+<register-use number="0">if R7 is a pointer, then R0 = pointer to new end of path indicator, or:
+<value-table>
+<value number="0">Corrupted</value>
+<value number="1">Corrupted</value>
+<value number="2">Corrupted</value>
+<value number="3">Size of output buffer</value>
+</value-table>
+</register-use>
+
+<register-use number="1" state="preserved" />
+<register-use number="2" state="preserved" />
+<register-use number="3" state="preserved" />
+<register-use number="4" state="preserved" />
+<register-use number="5" state="preserved" />
+<register-use number="6" state="preserved" />
+<register-use number="7" state="preserved" />
+</exit>
+
+<use>
+<p>All the other SWIs in the Draw module are converted into calls to this
+SWI. They are provided to ensure that suitable names exist for common
+operations and to reduce the number of registers to set up when calling.</p>
+
+<p>You may do the following things with this call, in this order:</p>
+
+<p>
+<list type="ordered">
+<item><p>Open subpaths may be closed (if selected by bit 27 of R1).
+</p></item>
+
+<item><p>The path may be flattened (if selected by bit 28 of R1). This uses
+R3.</p></item>
+
+<item><p>The path may be dashed (if R6 &ne; 0).</p></item>
+
+<item><p>The path may be thickened (if selected by bit 29 of R1). This uses
+R4 and R5.</p></item>
+
+<item><p>The path may be re-flattened (if selected by bit 30 of R1). This
+uses R3.</p></item>
+
+<item><p>The path may be transformed (if R2 &ne; 0).</p></item>
+
+<item><p>Finally, the path is output in one of a number of ways, depending
+on R7.</p></item>
+
+</list>
+</p>
+
+<p>Note that R3, R4 and R5 may be left unspecified if the options that use
+them are not specified.</p>
+
+<p>If you try dashing, thickening or filling on an unflattened Bezier curve,
+it will produce an error, as this is not allowed.</p>
+
+<p>If you are using the printer driver, then it will intercept this SWI and
+affect its operation. For more information, please read the chapter entitled <reference type="chapter" name="Printing a document from an application" href="../printing/printdoc" />.</p>
+
+<p>This call is also unable to handle R7 = 1 or 2.</p>
+
+</use>
+
+<related>
+<reference type="vector" name="DrawV" href="../overview/softwarevectors" />
+</related>
+</swi-definition>
+
+
+<swi-definition name="Draw_Fill"
+                number="40702"
+                description="Process a path and send to VDU, filling the interior portion"
+                irqs="enabled"
+                fiqs="enabled"
+                processor-mode="SVC"
+                re-entrant="no">
+
+<entry>
+<register-use number="0">pointer to <reference type="subsubsection" name="path">input path</reference></register-use>
+
+<register-use number="1"><reference type="subsubsection" name="fill style" />, or:
+<value-table>
+<value number="0">Default</value>
+</value-table>
+</register-use>
+
+<register-use number="2">pointer to <reference type="category" name="Matrix block" >transformation matrix block</reference>, or:
+<value-table>
+<value number="0">Identity matrix (no transformation)</value>
+</value-table>
+</register-use>
+
+<register-use number="3"><reference type="subsubsection" name="flatness" />, or:
+<value-table>
+<value number="0">Default</value>
+</value-table>
+</register-use>
+
+</entry>
+
+<exit>
+<register-use number="0" state="corrupted" />
+<register-use number="1" state="preserved" />
+<register-use number="2" state="preserved" />
+<register-use number="3" state="preserved" />
+</exit>
+
+<use>
+
+<p>This command emulates the PostScript 'fill' operator. It performs the
+following actions:</p>
+
+<p>
+<list>
+<item><p>closes open subpaths</p></item>
+
+<item><p>flattens the path</p></item>
+
+<item><p>transforms it to standard coordinates</p></item>
+
+<item><p>fills the resulting path and draws to the VDU.</p></item>
+
+</list>
+</p>
+
+<p>The fill style is as specified in the section entitled <reference type="subsubsection" name="Fill style" /> with the following addition. A fill style of zero is a special
+case. It specifies a useful default fill style, namely &hex;30. This means
+fill to halfway through boundary, non-zero rule.</p>
+
+<p>If you are using the printer driver, then it will intercept this SWI and
+affect its operation. For more information, please read the chapter entitled <reference type="chapter" name="Printing a document from an application" href="../printing/printdoc" />.</p>
+
+</use>
+
+<related>
+<reference type="vector" name="DrawV" href="../overview/softwarevectors" />
+</related>
+</swi-definition>
+
+
+<swi-definition name="Draw_Stroke"
+                number="40704"
+                description="Process a path and send to VDU"
+                irqs="enabled"
+                fiqs="enabled"
+                processor-mode="SVC"
+                re-entrant="no">
+
+<entry>
+<register-use number="0">pointer to <reference type="subsubsection" name="path">input path</reference></register-use>
+
+<register-use number="1"><reference type="subsubsection" name="fill style" />:
+<bitfield-table>
+<bit number="0-5">Common <reference type="subsubsection" name="fill style" /> bits</bit>
+<bit number="31">Plot the stroke all at once rather than one subpath at a time</bit>
+</bitfield-table>
+or:
+<value-table>
+<value number="0">Default</value>
+</value-table>
+</register-use>
+
+<register-use number="2">pointer to <reference type="category" name="Matrix block" >transformation matrix block</reference>, or:
+<value-table>
+<value number="0">Identity matrix (no transformation)</value>
+</value-table>
+</register-use>
+
+<register-use number="3"><reference type="subsubsection" name="flatness" />, or:
+<value-table>
+<value number="0">Default</value>
+</value-table>
+</register-use>
+
+<register-use number="4"><reference type="subsubsection" name="line thickness" />, or:
+<value-table>
+<value number="0">Default</value>
+</value-table>
+</register-use>
+
+<register-use number="5">pointer to <reference type="subsubsection" name="Cap and join">line cap and join</reference> specification (if required)</register-use>
+
+<register-use number="6">pointer to <reference type="subsubsection" name="dash pattern" />, or:
+<value-table>
+<value number="0">No dashes</value>
+</value-table>
+</register-use>
+
+</entry>
+
+<exit>
+<register-use number="0" state="corrupted" />
+<register-use number="1" state="preserved" />
+<register-use number="2" state="preserved" />
+<register-use number="3" state="preserved" />
+<register-use number="4" state="preserved" />
+<register-use number="5" state="preserved" />
+<register-use number="6" state="preserved" />
+</exit>
+
+<use>
+
+<p>This command emulates the PostScript 'stroke' operator. It performs the
+following actions:</p>
+
+<p>
+<list>
+<item><p>flattens the path</p></item>
+
+<item><p>applies a dash pattern to the path, if R6 &ne; 0</p></item>
+
+<item><p>thickens the path, using the specified joins and caps</p></item>
+
+<item><p>re-flattens the path, to flatten round caps and joins, so that they
+can be filled.</p></item>
+
+<item><p>transforms the path to standard coordinates</p></item>
+
+<item><p>fills the resulting path and draws to the VDU.</p></item>
+
+</list>
+</p>
+
+<p>The fill style is as specified in the section entitled <reference type="subsubsection" name="Fill style" />, with the following additions. A fill style of zero is a special
+case. If the line thickness in R4 is non-zero, then it means &hex;30, as in
+<reference type="swi" name="Draw_Fill" />. If R4 is zero, then &hex;18 is the default, as the flattened and
+thickened path will have no interior in this case.</p>
+
+<p>If the top bit of the fill style is set, this makes the Draw module plot
+the stroke all at once rather than one subpath at a time. This means the
+code will never double plot a pixel, but uses up much more temporary
+work-space.</p>
+
+<p>The line thickness is as specified in the section <reference type="subsubsection" name="Line thickness" />, with the following added restrictions:</p>
+
+<p>
+<list type="ordered">
+<item><p>If the specified thickness is zero, Draw cannot deal with filling non-boundary exterior
+pixels <strong>and</strong> not filling boundary exterior pixels at the same time<br />ie fill bit 2 set, and bit 3 clear - is invalid.</p></item>
+
+<item><p>If the specified thickness is non-zero, Draw cannot
+deal with filling just the boundary pixels, ie fill bits 5 - 2 being
+0110.</p></item>
+
+</list>
+</p>
+
+<p>If you are using the printer driver, then it will intercept this SWI and
+affect its operation. For more information, please read the chapter entitled <reference type="chapter" name="Printing a document from an application" href="../printing/printdoc" />.</p>
+
+<p>You should also be aware that most
+printer drivers will not pay any attention to bit 31 of the fill style - ie
+plot subpath by subpath or all at once (see above). Use <reference type="swi" name="Draw_ProcessPath" /> to
+get around this problem by processing it before stroking.</p>
+
+</use>
+
+<related>
+<reference type="swi" name="Draw_StrokePath" />
+<reference type="vector" name="DrawV" href="../overview/softwarevectors" />
+</related>
+</swi-definition>
+
+
+<swi-definition name="Draw_StrokePath"
+                number="40706"
+                description="Like Draw_Stroke, except writes its output to a path"
+                irqs="enabled"
+                fiqs="enabled"
+                processor-mode="SVC"
+                re-entrant="no">
+
+<entry>
+<register-use number="0">pointer to <reference type="subsubsection" name="path">input path</reference></register-use>
+
+<register-use number="1">pointer to <reference type="subsubsection" name="output path" />, or:
+<value-table>
+<value number="0">Calculate output buffer size</value>
+</value-table>
+</register-use>
+
+<register-use number="2">pointer to <reference type="category" name="Matrix block" >transformation matrix block</reference>, or:
+<value-table>
+<value number="0">Identity matrix (no transformation)</value>
+</value-table>
+</register-use>
+
+<register-use number="3"><reference type="subsubsection" name="flatness" />, or:
+<value-table>
+<value number="0">Default</value>
+</value-table>
+</register-use>
+
+<register-use number="4"><reference type="subsubsection" name="line thickness" />, or:
+<value-table>
+<value number="0">Default</value>
+</value-table>
+</register-use>
+
+<register-use number="5">pointer to <reference type="subsubsection" name="Cap and join">line cap and join</reference> specification</register-use>
+
+<register-use number="6">pointer to <reference type="subsubsection" name="dash pattern" />, or:
+<value-table>
+<value number="0">No dashes</value>
+</value-table>
+</register-use>
+</entry>
+
+<exit>
+<register-use number="0">calculated output buffer size (if R1 = 0), or<br />
+pointer to end of path marker in output path (if R1 is a pointer)
+</register-use>
+<register-use number="1" state="preserved" />
+<register-use number="2" state="preserved" />
+<register-use number="3" state="preserved" />
+<register-use number="4" state="preserved" />
+<register-use number="5" state="preserved" />
+<register-use number="6" state="preserved" />
+</exit>
+
+<use>
+
+<p>This call acts exactly like a call to <reference type="swi" name="Draw_Stroke" />, except that it doesn't
+write its output to the VDU, but to an output path.</p>
+
+</use>
+
+<related>
+<reference type="swi" name="Draw_Stroke" />
+<reference type="vector" name="DrawV" href="../overview/softwarevectors" />
+</related>
+</swi-definition>
+
+
+<swi-definition name="Draw_FlattenPath"
+                number="40708"
+                description="Converts an input path into a flattened output path"
+                irqs="enabled"
+                fiqs="enabled"
+                processor-mode="SVC"
+                re-entrant="no">
+
+<entry>
+<register-use number="0">pointer to <reference type="subsubsection" name="path">input path</reference></register-use>
+
+<register-use number="1">pointer to <reference type="subsubsection" name="output path" />, or:
+<value-table>
+<value number="0">Calculate output buffer size</value>
+</value-table>
+</register-use>
+
+<register-use number="2"><reference type="subsubsection" name="flatness" />, or:
+<value-table>
+<value number="0">Default</value>
+</value-table>
+</register-use>
+</entry>
+
+<exit>
+<register-use number="0">calculated output buffer size (if R1 = 0), or<br />
+pointer to end of path marker in output path (if R1 is a pointer)
+</register-use>
+<register-use number="1" state="preserved" />
+<register-use number="2" state="preserved" />
+</exit>
+
+<use>
+
+<p>This call acts like a subset of <reference type="swi" name="Draw_StrokePath" />. It will only flatten a
+path. This would be useful if you wanted to stroke a path multiple times and
+didn't want the speed penalty of flattening the path every time.</p>
+
+</use>
+
+<related>
+<reference type="swi" name="Draw_StrokePath" />
+<reference type="vector" name="DrawV" href="../overview/softwarevectors" />
+</related>
+</swi-definition>
+
+
+<swi-definition name="Draw_TransformPath"
+                number="4070A"
+                description="Converts an input path into a transformed output path"
+                irqs="enabled"
+                fiqs="enabled"
+                processor-mode="SVC"
+                re-entrant="no">
+
+<entry>
+<register-use number="0">pointer to <reference type="subsubsection" name="path">input path</reference></register-use>
+
+<register-use number="1">pointer to <reference type="subsubsection" name="output path" />, or:
+<value-table>
+<value number="0">Overwrite the input path</value>
+</value-table>
+</register-use>
+
+<register-use number="2">pointer to <reference type="category" name="Matrix block" >transformation matrix block</reference>, or:
+<value-table>
+<value number="0">Identity matrix (no transformation)</value>
+</value-table>
+</register-use>
+
+<register-use number="3">0</register-use>
+
+</entry>
+
+<exit>
+<register-use number="0">corrupted (if R1 = 0), or<br />
+pointer to end of path marker in output path (if R1 is a pointer)
+</register-use>
+<register-use number="1" state="preserved" />
+<register-use number="2" state="preserved" />
+<register-use number="3" state="preserved" />
+</exit>
+
+<use>
+
+<p>This call acts like a subset of <reference type="swi" name="Draw_StrokePath" />. It will only transform a
+path. This would be useful if you wanted to stroke a path multiple times and
+didn't want the speed penalty of transforming the path every time. It is
+also useful if you want to transform a path before dashing, thickening and
+so on, to avoid having the rounding errors from the latter operations
+magnified by the transformation.</p>
+
+</use>
+
+<related>
+<reference type="swi" name="Draw_StrokePath" />
+<reference type="vector" name="DrawV" href="../overview/softwarevectors" />
+</related>
+</swi-definition>
+
+</section>
+
+
+<section title="Application notes">
+
+<subsection title="Example of simple drawing">
+
+<p>The test program that is shown here was devised to represent millimetres
+internally and scale them to be the correct size when drawn on a particular
+monitor. Because monitors are different sizes, and even the same model can
+be adjusted differently in terms of vertical and horizontal picture size,
+this example would have to be adjusted to suit your particular setup.</p>
+
+<p>Note: The BASIC program described here is presented in a jumbled order so that
+the features are described and written one at a time. Once it is all typed
+in, then it will seem a lot more obvious.</p>
+
+<p>This example also has a restriction on screen modes. It will only work on
+one where the screen is 1280 OS units by 1024 OS units - which most of the
+current modes are (but not, for example, 132 column modes).</p>
+
+<p>The first two stages in the process are as follows:</p>
+
+<p>
+<list>
+<item><p>Covert OS units to Internal draw units</p></item>
+<item><p>Measure display area</p></item>
+</list>
+</p>
+
+<p>In this example, this corresponds to:</p>
+
+<p>
+<value-table head-number="OS units" head-name="Internal Draw units" head-value="Measured display area">
+<value number="1280" name="327,680">210mm</value>
+<value number="1024" name="262,144">160mm</value>
+</value-table>
+</p>
+
+<p>Because of scaling limitations, we will work with a user scale of
+thousandths of millimetres.</p>
+
+<p>
+<value-table head-number="Measured display area (mm)" head-value="User units">
+<value number="210">210,000</value>
+<value number="160">160,000</value>
+</value-table>
+</p>
+
+<subsubsection title="Working with a transformation matrix">
+
+<p>The next step is to work out the scaling factors for the transformation
+matrix. We need to calcualte how many internal Draw units there are per user unit. Taking our previous calculations, we derive the numbers as shown in the table.</p>
+
+<p>
+<value-table head-number="Internal draw units" head-name="User units" head-value="Internal Draw units per user unit">
+<value number="327,680" name="210,000">1.5604</value>
+<value number="262,144" name="160,000">1.6384</value>
+</value-table>
+</p>
+
+
+<p>These figures must now be converted to the Transform units used for
+scaling in the transformation matrix. The 32 bit Transform number is
+2<sup>16</sup> times the actual value, since its fractional part is 16 bits
+long. So to calculate the Tranform units, all Internal Draw units per user unit values must be 1&lsl;16. This is shown in the table below</p>
+
+
+<p>
+<value-table head-number="Internal Draw units per user unit" head-value="Tranform units">
+<value number="1.5604">102,261 (&hex;18F75)</value>
+<value number="1.6384">107,374 (&hex;1A36E)</value>
+</value-table>
+</p>
+
+<p>With the x scale factor and y scale factor now calculated, the <reference type="subsubsection" name="transformation matrix" /> is initialised as follows:</p>
+
+
+<p><image type="png" src="draw_matrix_example.png" /></p>
+
+<p>This could be calculated automatically, using the following BASIC code,
+which, whilst not the most efficient, is hopefully the clearest way of
+representing it:</p>
+
+<p>
+<extended-example type="basic">
+ 30 xsize = 210000
+ 35 ysize = 160000
+ 40 xscale% = (1280 * 256 / xsize) * &hex;010000
+ 50 yscale% = (1024 * 256 / ysize) * &hex;010000
+</extended-example>
+</p>
+
+<p>After this, <variable>xscale%</variable> would be &hex;00018F75 and <variable>yscale%</variable> would be
+&hex;0001A36E, the values to place in the matrix. The matrix would be
+programmed as follows:</p>
+
+<p>
+<extended-example type="basic">
+ 20 DIM transform% 23
+ 60 transform%!0 = xscale%  :REM element a in the matrix
+ 70 transform%!4 = 0        :REM element b
+ 80 transform%!8 = 0        :REM element c
+ 90 transform%!12 = yscale% :REM element d
+100 transform%!16 = 0       :REM element e
+110 transform%!20 = 0       :REM element f
+</extended-example>
+</p>
+
+</subsubsection>
+
+
+<subsubsection title="Important">
+
+<p>It is important to remember that, whilst this example is using
+thousandths of millimetres as its internal coordinate system, they could be
+anything within the valid limits. Draw is not affected by what they are.
+Using the technique described above, <strong>any</strong> valid units can be
+used. We used 210,000 by 160,000 user units for our scale; it could be 500,000
+by 350,000 or 654,363 by 314,159 or whatever. This program will work with all
+valid scales, simply by changing the definitions of xsize and ysize.</p>
+
+</subsubsection>
+
+<subsubsection title="Creating the path">
+
+<p>In order to create the path, this simple program uses a procedure to put
+a single word into the path and advance the pointer. In a large application,
+it would be a good idea to write individual routines to generate each
+element type, because this technique would become tedious in a large
+program.</p>
+
+<p>This preamble defines what needs to be at the start of the program.
+Notice that line 20 overwrites the earlier definition.</p>
+
+<p>
+<extended-example type="basic">
+ 10 pathlength% = 256
+ 20 DIM path% pathlength% - 1, transform% 23
+160 pathptr% = 0 :REM Initialise the pointer
+</extended-example>
+</p>
+
+<p>Later on in the program would be the procedure to add a word to the
+path:</p>
+
+<p>
+<extended-example type="basic">
+320 END
+330 DEF PROCadd(value%)
+340 IF pathptr%+4 &gt; pathlength% THEN ERROR 0, "Insufficient path buffer"
+350 path%!pathptr% = value%
+360 pathptr% += 4
+370 ENDPROC
+</extended-example>
+</p>
+
+<p>The simple path shown here generates a rectangle with no bottom line. It
+is 90mm by 40mm and offset by 80mm in the x and y axes from the origin.</p>
+
+<p>
+<extended-example type="basic">
+170 PROCadd(2) : PROCadd(80000) : PROCadd(80000)   :REM Move to start
+180 PROCadd(8) : PROCadd(80000) : PROCadd(120000)  :REM Draw
+190 PROCadd(8) : PROCadd(170000) : PROCadd(120000)
+200 PROCadd(8) : PROCadd(170000) : PROCadd(80000)
+250 PROCadd(4)                                     : REM Close the subpath. PROCadd(5) would close the rectangle
+260 PROCadd(0) : PROCadd(pathlength%-pathptr%-4)   :REM End path
+</extended-example>
+</p>
+
+</subsubsection>
+
+
+<subsubsection title="Simple stroke">
+
+<p>Once the path and the transformation matrix have been completed, all that
+remains is to set the graphics origin and stroke the path onto the
+screen.</p>
+
+<p>
+<extended-example type="basic">
+270 VDU 29,0;0;
+280 SYS "Draw_Stroke", path%, 0, transform%, 0, 0, 0, 0
+</extended-example>
+</p>
+
+</subsubsection>
+
+
+<subsubsection title="Translation">
+
+<p>Another matrix operation that can be performed is translation, or moving.
+Remember that the parameters in the matrix are in internal Draw coordinates,
+not the millimetres used in this example as user coordinates. If you want to
+translate in OS coordinates, then the translation must be multiplied by
+256.</p>
+
+<p>In this example, we are going to re-stroke the path, translated 60 OS
+units in x and -100 OS units in y.</p>
+
+<p>
+<extended-example type="basic">
+290 transform%!16 = 60&lsl;8
+300 transform%!20 = -100&lsl;8
+310 SYS "Draw_Stroke", path%, 0, transform%, 0, 0, 0, 0
+</extended-example>
+</p>
+
+<p>You will now see two versions of the path, the new one 100 OS units lower
+and 60 OS units shifted to the right.</p>
+
+<p>Similarly, the matrix may be modified to rotate the path. If you aren't
+sure how to do this, then see any mathematical text on matrix
+arithmetic.</p>
+
+</subsubsection>
+
+
+<subsubsection title="Curves">
+
+<p>In order to add a curve to the path, we will add a new subpath to the
+section that creates the path. This curve draws an alpha shape. Note that
+element type 2 implicitly closes the initial subpath:</p>
+
+<p>
+<extended-example type="basic">
+210 PROCadd(2) : PROCadd(50000) : PROCadd(50000)   :REM x1, y1
+220 PROCadd(6) : PROCadd(80000) : PROCadd(80000)   :REM x2, y2
+230 PROCadd(85000) : PROCadd(30000)                :REM x3, y3
+240 PROCadd(50000) : PROCadd(60000)                :REM x4, y4
+</extended-example>
+</p>
+
+<p>Whilst the flatness can be left at its default value, this shows how the
+stroke commands can be changed to set the flatness to a sensible value. 640
+is used because this program was run in a 640 pixel mode.</p>
+
+<p>
+<extended-example type="basic">
+280 SYS "Draw_Stroke", path%, 0, transform%, xsize/640, 0, 0, 0
+310 SYS "Draw_Stroke", path%, 0, transform%, xsize/640, 0, 0, 0
+</extended-example>
+</p>
+
+</subsubsection>
+
+
+<subsubsection title="Line thickness">
+
+<p>To make the lines shown thicker than the default, it is necessary to
+specify a thickness and also the joins and caps block. Notice that line 20
+has been changed to allocate space for the joins and caps block. We will use
+round caps and bevelled joints.</p>
+
+<p>
+<extended-example type="basic">
+ 20 DIM path% pathlength%-1, transform% 23, joinsandcaps% 15
+120 joinsandcaps%!0 = &hex;010102
+130 joinsandcaps%!4 = 0
+140 joinsandcaps%!8 = 0
+150 joinsandcaps%!12 = 0
+</extended-example>
+</p>
+
+<p>Now all that remains is to change the stroke commands to specify a
+thickness and point to the block just specified. For this example we will
+make the first stroke 5000 units (5mm) thick and the second one half
+that:</p>
+
+<p>
+<extended-example type="basic">
+280 SYS "Draw_Stroke", path%, 0, transform%, xsize/640, 5000, joinsandcaps%, 0
+310 SYS "Draw_Stroke", path%, 0, transform%, xsize/640, 2500, joinsandcaps%, 0
+</extended-example>
+</p>
+
+<p>Plainly, there are many more features that could be added to this
+program. But you should have the idea now of how it fits together and be
+able to experiment for yourself.</p>
+
+</subsubsection>
+
+
+<subsubsection title="Output from the example program">
+
+<p>The BASIC program when <command>RUN</command>, should display something similar to the following:</p>
+
+<p><image type="png" src="draw_example_output.png" caption="Output from the example program" /></p>
+
+</subsubsection>
+
+
+<subsubsection title="Example program in full">
+
+<p>
+<extended-example type="basic">
+ 10 pathlength% = 256
+ 20 DIM path% pathlength%-1, transform% 23, joinsandcaps% 15
+ 30 xsize = 210000
+ 35 ysize = 160000
+ 40 xscale% = (1280 * 256 / xsize) * &hex;010000
+ 50 yscale% = (1024 * 256 / ysize) * &hex;010000 
+ 60 transform%!0 = xscale%                         :REM element a in the matrix
+ 70 transform%!4 = 0                               :REM element b
+ 80 transform%!8 = 0                               :REM element c
+ 90 transform%!12 = yscale%                        :REM element d
+100 transform%!16 = 0                              :REM element e
+110 transform%!20 = 0                              :REM element f
+120 joinsandcaps%!0 = &hex;010102
+130 joinsandcaps%!4 = 0
+140 joinsandcaps%!8 = 0
+150 joinsandcaps%!12 = 0
+160 pathptr% = 0 :REM Initialise the pointer
+170 PROCadd(2) : PROCadd(80000)  : PROCadd(80000)  :REM Move to start
+180 PROCadd(8) : PROCadd(80000)  : PROCadd(120000) :REM Draw
+190 PROCadd(8) : PROCadd(170000) : PROCadd(120000)
+200 PROCadd(8) : PROCadd(170000) : PROCadd(80000)
+210 PROCadd(2) : PROCadd(50000)  : PROCadd(50000)  :REM x1, y1
+220 PROCadd(6) : PROCadd(80000)  : PROCadd(80000)  :REM x2, y2
+230 PROCadd(85000) : PROCadd(30000)                :REM x3, y3
+240 PROCadd(50000) : PROCadd(60000)                :REM x4, y4
+250 PROCadd(4)                                     :REM Close the subpath. PROCadd(5) would close the rectangle
+260 PROCadd(0) : PROCadd(pathlength%-pathptr%-4)   :REM End path
+270 VDU 29,0;0;
+280 SYS "Draw_Stroke", path%, 0, transform%, xsize/640, 5000, joinsandcaps%, 0
+290 transform%!16 = 60&lsl;8
+300 transform%!20 = -100&lsl;8
+310 SYS "Draw_Stroke", path%, 0, transform%, xsize/640, 2500, joinsandcaps%, 0
+320 END
+330 DEF PROCadd(value%)
+340 IF pathptr%+4 &gt; pathlength% THEN ERROR 0, "Insufficient path buffer"
+350 path%!pathptr% = value%
+360 pathptr% += 4
+370 ENDPROC
+</extended-example>
+</p>
+
+</subsubsection>
+
+</subsection>
+
+</section>
+
+</chapter>
+
+<meta>
+
+</meta>
+
+</riscos-prm>
