@@ -1,0 +1,173 @@
+/*******************************************************************
+ * File:     types
+ * Purpose:  Types used for the Draw module
+ * Author:   Gerph
+ * Date:     25 Aug 2025
+ ******************************************************************/
+
+#ifndef TYPES_H
+#define TYPES_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+
+/* Constants */
+
+/* .Bits */
+#define Error_DrawReservedDrawBits               ((uint32_t)0x982)
+#define Error_DrawBadPathSequence                ((uint32_t)0x985)
+#define Error_DrawDrawNeedsGraphicsMode          ((uint32_t)0x98b)
+#define Error_DrawBadPathElement                 ((uint32_t)0x984)
+#define Error_DrawPathNotFlat                    ((uint32_t)0x988)
+#define Error_DrawMayExpandPath                  ((uint32_t)0x986)
+#define Error_DrawUnimplementedDraw              ((uint32_t)0x9ff)
+#define Error_DrawNoDrawInIRQMode                ((uint32_t)0x980)
+#define Error_DrawBadDrawReasonCode              ((uint32_t)0x981)
+#define Error_DrawBadCapsOrJoins                 ((uint32_t)0x989)
+#define Error_DrawPathFull                       ((uint32_t)0x987)
+#define Error_DrawTransformOverflow              ((uint32_t)0x98a)
+#define Error_DrawInvalidDrawAddress             ((uint32_t)0x983)
+
+/* .Int */
+#define Draw_OSUnit                              ((1<<8)) /* 1 OS unit in draw units */
+#define Draw_Point                               (640) /* 1pt in draw units */
+#define Draw_Inch                                (46080) /* 1in in draw units */
+#define Draw_FillWindingRuleShift                (0)
+
+/* DrawV_Reason */
+#define DrawV_FlattenPath                        ((DrawV_Reason)8)
+#define DrawV_StrokePath                         ((DrawV_Reason)6)
+#define DrawV_Fill                               ((DrawV_Reason)2)
+#define DrawV_Stroke                             ((DrawV_Reason)4)
+#define DrawV_TransformPath                      ((DrawV_Reason)10)
+#define DrawV_FillClipped                        ((DrawV_Reason)12)
+#define DrawV_ProcessPath                        ((DrawV_Reason)0)
+#define DrawV_StrokeClipped                      ((DrawV_Reason)14)
+
+/* Draw_CapStyle */
+#define Draw_CapSquare                           ((Draw_CapStyle)(1<<1))
+#define Draw_CapRound                            ((Draw_CapStyle)(1<<0))
+#define Draw_CapButt                             ((Draw_CapStyle)0)
+#define Draw_CapTriangular                       ((Draw_CapStyle)3)
+
+/* Draw_FillStyle */
+#define Draw_FillFullInterior                    ((Draw_FillStyle)(1<<5))
+#define Draw_FillOutputBBox                      ((Draw_FillStyle)0x2000000) /* RISC OS 5+ */
+#define Draw_FillPositive                        ((Draw_FillStyle)3)
+#define Draw_FillFlatten                         ((Draw_FillStyle)0x10000000)
+#define Draw_FillNegative                        ((Draw_FillStyle)(1<<0))
+#define Draw_FillNonzero                         ((Draw_FillStyle)0)
+#define Draw_Fill32BitClean                      ((Draw_FillStyle)0x4000000) /* RISC OS 5+ */
+#define Draw_FillThicken                         ((Draw_FillStyle)0x20000000)
+#define Draw_FillFloat                           ((Draw_FillStyle)0x80000000)
+#define Draw_FillReflatten                       ((Draw_FillStyle)0x40000000)
+#define Draw_FillInteriorBoundary                ((Draw_FillStyle)(1<<4))
+#define Draw_FillExteriorBoundary                ((Draw_FillStyle)(1<<3))
+#define Draw_FillCloseOpenSubpaths               ((Draw_FillStyle)0x8000000)
+#define Draw_FillWindingRule                     ((Draw_FillStyle)3)
+#define Draw_FillFullExterior                    ((Draw_FillStyle)(1<<2))
+#define Draw_FillEvenOdd                         ((Draw_FillStyle)(1<<1))
+
+/* Draw_JoinStyle */
+#define Draw_JoinMitred                          ((Draw_JoinStyle)0)
+#define Draw_JoinBevelled                        ((Draw_JoinStyle)(1<<1))
+#define Draw_JoinRound                           ((Draw_JoinStyle)(1<<0))
+
+/* Draw_OutputPath */
+#define Draw_SpecialFill                         ((Draw_OutputPath)(1<<0))
+#define Draw_SpecialFillBySubpaths               ((Draw_OutputPath)(1<<1))
+#define Draw_SpecialInSitu                       ((Draw_OutputPath)0)
+#define Draw_SpecialCount                        ((Draw_OutputPath)3)
+#define Draw_SpecialBBox                         ((Draw_OutputPath)0x80000000)
+
+/* Draw_Tag */
+#define Draw_CloseGap                            ((Draw_Tag)(1<<2))
+#define Draw_GapTo                               ((Draw_Tag)7)
+#define Draw_BezierTo                            ((Draw_Tag)6)
+#define Draw_LineTo                              ((Draw_Tag)(1<<3))
+#define Draw_SpecialMoveTo                       ((Draw_Tag)3)
+#define Draw_MoveTo                              ((Draw_Tag)(1<<1))
+#define Draw_CloseLine                           ((Draw_Tag)5)
+#define Draw_Continuation                        ((Draw_Tag)(1<<0))
+#define Draw_EndPath                             ((Draw_Tag)0)
+
+
+
+/* Types */
+
+typedef int32_t DrawV_Reason;
+
+typedef uint8_t Draw_CapStyle;
+
+typedef uint8_t Draw_Tag;
+
+struct OS_Coord_s {
+    int32_t x;
+    int32_t y;
+};
+typedef struct OS_Coord_s OS_Coord;
+
+struct Draw_PathElement_s {
+    Draw_Tag tag;
+    uint8_t reserved[3];
+    union {
+        int32_t end_path;
+        Draw_PathElement * continuation;
+        OS_Coord move_to;
+        OS_Coord special_move_to;
+        OS_Coord bezier_to[3];
+        OS_Coord gap_to;
+        OS_Coord line_to;
+        uint8_t reserved[24];
+    } data;
+};
+typedef struct Draw_PathElement_s Draw_PathElement;
+
+struct Draw_Path_s {
+    Draw_PathElement elements[1];
+};
+typedef struct Draw_Path_s Draw_Path;
+
+typedef uint32_t Draw_FillStyle;
+
+struct OS_Trfm_s {
+    int32_t entries[3][2];
+};
+typedef struct OS_Trfm_s OS_Trfm;
+
+struct Draw_ClipDescriptor_s {
+    Draw_Path * path;
+    Draw_FillStyle fill_style;
+    OS_Trfm trfm;
+};
+typedef struct Draw_ClipDescriptor_s Draw_ClipDescriptor;
+
+struct Draw_DashPattern_s {
+    int32_t start;
+    int32_t element_count;
+    int32_t elements[1];
+};
+typedef struct Draw_DashPattern_s Draw_DashPattern;
+
+typedef uint8_t Draw_JoinStyle;
+
+struct Draw_LineStyle_s {
+    Draw_JoinStyle join_style;
+    Draw_CapStyle end_cap_style;
+    Draw_CapStyle start_cap_style;
+    uint8_t reserved;
+    int32_t mitre_limit;
+    int16_t start_cap_width;
+    int16_t start_cap_length;
+    int16_t end_cap_width;
+    int16_t end_cap_length;
+};
+typedef struct Draw_LineStyle_s Draw_LineStyle;
+
+typedef Draw_Path * Draw_OutputPath;
+
+
+
+
+#endif

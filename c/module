@@ -1,0 +1,400 @@
+/*******************************************************************
+ * File:     module
+ * Purpose:  SWI veneers for the Draw module
+ * Author:   Gerph
+ * Date:     25 Aug 2025
+ ******************************************************************/
+
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "kernel.h"
+#include "modhead.h"
+#include "types.h"
+
+
+/* Define this to debug this file */
+//#define DEBUG
+
+
+#ifdef DEBUG
+#define dprintf if (1) printf
+#else
+#define dprintf if (0) printf
+#endif
+
+
+
+
+/***************************************************************************
+ * Function:     Mod_Init
+ * Description:  Initialise the module, setting up vectors, callbacks and
+ *               any other parts of the system necessary for the module to
+ *               function.
+ * Parameters:   tail        = pointer to command line (control terminated)
+ *               podule_base = address of podule module was started from, or
+ *                             NULL if none
+ *               pw          = private word for module
+ * On exit:      Return NULL for successful initialisation, or a pointer to
+ *               an error block if the module could not start properly.
+ **************************************************************************/
+_kernel_oserror *Mod_Init(const char *tail, int podule_base, void *pw)
+{
+    _kernel_oserror *err = NULL;
+    dprintf("Draw initialised\n");
+    return err;
+}
+
+
+
+/***************************************************************************
+ * Function:     Mod_Final
+ * Description:  Finalise the module, shutting down any systems necessary,
+ *               freeing vectors and releasing workspace
+ * Parameters:   fatal       = fatality indicator; 1 if fatal, 0 if
+ *                             reinitialising
+ *               podule_base = address of podule module was started from, or
+ *                             NULL if none
+ *               pw          = private word for module
+ * On exit:      Return 0 for successful finalisation, or a pointer to an
+ *               error block if module was not shutdown properly.
+ **************************************************************************/
+_kernel_oserror *Mod_Final(int fatal, int podule_base, void *pw)
+{
+    dprintf("Draw finalised\n");
+    return NULL;
+}
+
+
+
+
+/***************************************************************************
+ * Description:  SWI handler routine for Draw_ProcessPath
+ * Parameters:   number = SWI number within SWI chunk (i.e. 0 to 63)
+ *               r      = pointer to register block on entry
+ *               pw     = private word for module
+ * On exit:      Return NULL if SWI handled sucessfully, setting return
+ *               register values (r0-r9) in r.
+ *               Return error_BAD_SWI for out of range SWIs.
+ *               Return an error block for a custom error.
+ **************************************************************************/
+_kernel_oserror *SWI_ProcessPath(int number, _kernel_swi_regs *regs, void *pw)
+{
+    _kernel_oserror *err = NULL;
+    /*
+     * Draw_ProcessPath - Main Draw SWI
+     *
+     * =>  R0 -> path
+     *     R1 = fill_style
+     *     R2 -> trfm
+     *     R3 = flatness
+     *     R4 = thickness
+     *     R5 -> line_style
+     *     R6 -> dash_pattern
+     *     R7 = processed_path
+     * <=  R0 = end_or_used
+     */
+
+    /* Input registers */
+    Draw_Path *path = (Draw_Path *)regs->r[0];
+    Draw_FillStyle fill_style = (Draw_FillStyle)regs->r[1];
+    OS_Trfm *trfm = (OS_Trfm *)regs->r[2];
+    int32_t flatness = (int32_t)regs->r[3];
+    int32_t thickness = (int32_t)regs->r[4];
+    Draw_LineStyle *line_style = (Draw_LineStyle *)regs->r[5];
+    Draw_DashPattern *dash_pattern = (Draw_DashPattern *)regs->r[6];
+    Draw_OutputPath processed_path = (Draw_OutputPath)regs->r[7];
+    /* Output registers */
+    void * end_or_used;
+
+    /* FIXME: SWI not yet implemented */
+
+    regs->r[0] = (int)end_or_used;  // &.Data
+    return err;
+}
+
+
+
+
+/***************************************************************************
+ * Description:  SWI handler routine for Draw_Fill
+ * Parameters:   number = SWI number within SWI chunk (i.e. 0 to 63)
+ *               r      = pointer to register block on entry
+ *               pw     = private word for module
+ * On exit:      Return NULL if SWI handled sucessfully, setting return
+ *               register values (r0-r9) in r.
+ *               Return error_BAD_SWI for out of range SWIs.
+ *               Return an error block for a custom error.
+ **************************************************************************/
+_kernel_oserror *SWI_Fill(int number, _kernel_swi_regs *regs, void *pw)
+{
+    _kernel_oserror *err = NULL;
+    /*
+     * Draw_Fill - Processes a path and sends it to the VDU, filling the interior portion
+     *
+     * =>  R0 -> path
+     *     R1 = fill_style
+     *     R2 -> trfm
+     *     R3 = flatness
+     */
+
+    /* Input registers */
+    Draw_Path *path = (Draw_Path *)regs->r[0];
+    Draw_FillStyle fill_style = (Draw_FillStyle)regs->r[1];
+    OS_Trfm *trfm = (OS_Trfm *)regs->r[2];
+    int32_t flatness = (int32_t)regs->r[3];
+
+    /* FIXME: SWI not yet implemented */
+
+    return err;
+}
+
+
+
+
+/***************************************************************************
+ * Description:  SWI handler routine for Draw_Stroke
+ * Parameters:   number = SWI number within SWI chunk (i.e. 0 to 63)
+ *               r      = pointer to register block on entry
+ *               pw     = private word for module
+ * On exit:      Return NULL if SWI handled sucessfully, setting return
+ *               register values (r0-r9) in r.
+ *               Return error_BAD_SWI for out of range SWIs.
+ *               Return an error block for a custom error.
+ **************************************************************************/
+_kernel_oserror *SWI_Stroke(int number, _kernel_swi_regs *regs, void *pw)
+{
+    _kernel_oserror *err = NULL;
+    /*
+     * Draw_Stroke - Processes a path and sends it to the VDU
+     *
+     * =>  R0 -> path
+     *     R1 = fill_style
+     *     R2 -> trfm
+     *     R3 = flatness
+     *     R4 = thickness
+     *     R5 -> line_style
+     *     R6 -> dash_pattern
+     */
+
+    /* Input registers */
+    Draw_Path *path = (Draw_Path *)regs->r[0];
+    Draw_FillStyle fill_style = (Draw_FillStyle)regs->r[1];
+    OS_Trfm *trfm = (OS_Trfm *)regs->r[2];
+    int32_t flatness = (int32_t)regs->r[3];
+    int32_t thickness = (int32_t)regs->r[4];
+    Draw_LineStyle *line_style = (Draw_LineStyle *)regs->r[5];
+    Draw_DashPattern *dash_pattern = (Draw_DashPattern *)regs->r[6];
+
+    /* FIXME: SWI not yet implemented */
+
+    return err;
+}
+
+
+
+
+/***************************************************************************
+ * Description:  SWI handler routine for Draw_StrokePath
+ * Parameters:   number = SWI number within SWI chunk (i.e. 0 to 63)
+ *               r      = pointer to register block on entry
+ *               pw     = private word for module
+ * On exit:      Return NULL if SWI handled sucessfully, setting return
+ *               register values (r0-r9) in r.
+ *               Return error_BAD_SWI for out of range SWIs.
+ *               Return an error block for a custom error.
+ **************************************************************************/
+_kernel_oserror *SWI_StrokePath(int number, _kernel_swi_regs *regs, void *pw)
+{
+    _kernel_oserror *err = NULL;
+    /*
+     * Draw_StrokePath - Processes a path and writes its output to another path
+     *
+     * =>  R0 -> path
+     *     R1 = stroked_path
+     *     R2 -> trfm
+     *     R3 = flatness
+     *     R4 = thickness
+     *     R5 -> line_style
+     *     R6 -> dash_pattern
+     * <=  R0 = end_or_used
+     */
+
+    /* Input registers */
+    Draw_Path *path = (Draw_Path *)regs->r[0];
+    Draw_Path * stroked_path = (Draw_Path *)regs->r[1];
+    OS_Trfm *trfm = (OS_Trfm *)regs->r[2];
+    int32_t flatness = (int32_t)regs->r[3];
+    int32_t thickness = (int32_t)regs->r[4];
+    Draw_LineStyle *line_style = (Draw_LineStyle *)regs->r[5];
+    Draw_DashPattern *dash_pattern = (Draw_DashPattern *)regs->r[6];
+    /* Output registers */
+    void * end_or_used;
+
+    /* FIXME: SWI not yet implemented */
+
+    regs->r[0] = (int)end_or_used;  // &.Data
+    return err;
+}
+
+
+
+
+/***************************************************************************
+ * Description:  SWI handler routine for Draw_FlattenPath
+ * Parameters:   number = SWI number within SWI chunk (i.e. 0 to 63)
+ *               r      = pointer to register block on entry
+ *               pw     = private word for module
+ * On exit:      Return NULL if SWI handled sucessfully, setting return
+ *               register values (r0-r9) in r.
+ *               Return error_BAD_SWI for out of range SWIs.
+ *               Return an error block for a custom error.
+ **************************************************************************/
+_kernel_oserror *SWI_FlattenPath(int number, _kernel_swi_regs *regs, void *pw)
+{
+    _kernel_oserror *err = NULL;
+    /*
+     * Draw_FlattenPath - Flattens a path and writes its output to another path
+     *
+     * =>  R0 -> path
+     *     R1 = flattened_path
+     *     R2 = flatness
+     * <=  R0 = end_or_used
+     */
+
+    /* Input registers */
+    Draw_Path *path = (Draw_Path *)regs->r[0];
+    Draw_Path * flattened_path = (Draw_Path *)regs->r[1];
+    int32_t flatness = (int32_t)regs->r[2];
+    /* Output registers */
+    void * end_or_used;
+
+    /* FIXME: SWI not yet implemented */
+
+    regs->r[0] = (int)end_or_used;  // &.Data
+    return err;
+}
+
+
+
+
+/***************************************************************************
+ * Description:  SWI handler routine for Draw_TransformPath
+ * Parameters:   number = SWI number within SWI chunk (i.e. 0 to 63)
+ *               r      = pointer to register block on entry
+ *               pw     = private word for module
+ * On exit:      Return NULL if SWI handled sucessfully, setting return
+ *               register values (r0-r9) in r.
+ *               Return error_BAD_SWI for out of range SWIs.
+ *               Return an error block for a custom error.
+ **************************************************************************/
+_kernel_oserror *SWI_TransformPath(int number, _kernel_swi_regs *regs, void *pw)
+{
+    _kernel_oserror *err = NULL;
+    /*
+     * Draw_TransformPath - Transforms a path and writes its output to another path
+     *
+     * =>  R0 -> path
+     *     R1 = transformed_path
+     *     R2 -> trfm
+     *     R3 = &0 (constant)
+     * <=  R0 = end_or_used
+     */
+
+    /* Input registers */
+    Draw_Path *path = (Draw_Path *)regs->r[0];
+    Draw_Path * transformed_path = (Draw_Path *)regs->r[1];
+    OS_Trfm *trfm = (OS_Trfm *)regs->r[2];
+    /* R3 is 0 */
+    /* Output registers */
+    void * end_or_used;
+
+    /* FIXME: SWI not yet implemented */
+
+    regs->r[0] = (int)end_or_used;  // &.Data
+    return err;
+}
+
+
+
+
+/***************************************************************************
+ * Description:  SWI handler routine for Draw_FillClipped
+ * Parameters:   number = SWI number within SWI chunk (i.e. 0 to 63)
+ *               r      = pointer to register block on entry
+ *               pw     = private word for module
+ * On exit:      Return NULL if SWI handled sucessfully, setting return
+ *               register values (r0-r9) in r.
+ *               Return error_BAD_SWI for out of range SWIs.
+ *               Return an error block for a custom error.
+ **************************************************************************/
+_kernel_oserror *SWI_FillClipped(int number, _kernel_swi_regs *regs, void *pw)
+{
+    _kernel_oserror *err = NULL;
+    /*
+     * Draw_FillClipped - Processes a path and sends it to the VDU, filling the interior portion and clipping against the clip descriptor - RISC OS 5+
+     *
+     * =>  R0 -> path
+     *     R1 = fill_style
+     *     R2 -> trfm
+     *     R3 = flatness
+     *     R4 -> clip_descriptor
+     */
+
+    /* Input registers */
+    Draw_Path *path = (Draw_Path *)regs->r[0];
+    Draw_FillStyle fill_style = (Draw_FillStyle)regs->r[1];
+    OS_Trfm *trfm = (OS_Trfm *)regs->r[2];
+    int32_t flatness = (int32_t)regs->r[3];
+    Draw_ClipDescriptor *clip_descriptor = (Draw_ClipDescriptor *)regs->r[4];
+
+    /* FIXME: SWI not yet implemented */
+
+    return err;
+}
+
+
+
+
+/***************************************************************************
+ * Description:  SWI handler routine for Draw_StrokeClipped
+ * Parameters:   number = SWI number within SWI chunk (i.e. 0 to 63)
+ *               r      = pointer to register block on entry
+ *               pw     = private word for module
+ * On exit:      Return NULL if SWI handled sucessfully, setting return
+ *               register values (r0-r9) in r.
+ *               Return error_BAD_SWI for out of range SWIs.
+ *               Return an error block for a custom error.
+ **************************************************************************/
+_kernel_oserror *SWI_StrokeClipped(int number, _kernel_swi_regs *regs, void *pw)
+{
+    _kernel_oserror *err = NULL;
+    /*
+     * Draw_StrokeClipped - Processes a path and sends it to the VDU after clipping against the clip descriptor - RISC OS 5+
+     *
+     * =>  R0 -> path
+     *     R1 = fill_style
+     *     R2 -> trfm
+     *     R3 = flatness
+     *     R4 = thickness
+     *     R5 -> line_style
+     *     R6 -> dash_pattern
+     *     R7 -> clip_descriptor
+     */
+
+    /* Input registers */
+    Draw_Path *path = (Draw_Path *)regs->r[0];
+    Draw_FillStyle fill_style = (Draw_FillStyle)regs->r[1];
+    OS_Trfm *trfm = (OS_Trfm *)regs->r[2];
+    int32_t flatness = (int32_t)regs->r[3];
+    int32_t thickness = (int32_t)regs->r[4];
+    Draw_LineStyle *line_style = (Draw_LineStyle *)regs->r[5];
+    Draw_DashPattern *dash_pattern = (Draw_DashPattern *)regs->r[6];
+    Draw_ClipDescriptor *clip_descriptor = (Draw_ClipDescriptor *)regs->r[7];
+
+    /* FIXME: SWI not yet implemented */
+
+    return err;
+}
+
