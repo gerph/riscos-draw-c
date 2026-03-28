@@ -1,0 +1,313 @@
+/*******************************************************************
+ * File:        flatten
+ * Purpose:     Flatten Bezier curves in a Draw path into line segments
+ * Author:      Charles Ferguson
+ ******************************************************************/
+
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#include "types.h"
+
+
+/*
+ * Calculate the squared distance from a point to a line segment.
+ * Returns the squared perpendicular distance.
+ */
+static int32_t point_line_distance_squared(int32_t px, int32_t py,
+                                           int32_t x1, int32_t y1,
+                                           int32_t x2, int32_t y2)
+{
+    int32_t dx, dy, len_sq, t, closest_x, closest_y, pdx, pdy;
+
+    dx = x2 - x1;
+    dy = y2 - y1;
+    len_sq = dx * dx + dy * dy;
+
+    if (len_sq == 0)
+    {
+        /* Line segment is a point */
+        pdx = px - x1;
+        pdy = py - y1;
+        return pdx * pdx + pdy * pdy;
+    }
+
+    /* Project point onto line, clamped to segment */
+    t = ((px - x1) * dx + (py - y1) * dy) / len_sq;
+
+    if (t < 0) t = 0;
+    if (t > 256) t = 256;  /* Using 256 as fixed-point 1.0 */
+
+    closest_x = x1 + (dx * t) / 256;
+    closest_y = y1 + (dy * t) / 256;
+
+    pdx = px - closest_x;
+    pdy = py - closest_y;
+    return pdx * pdx + pdy * pdy;
+}
+
+
+/*
+ * Check if a Bezier curve is flat enough.
+ * A curve is considered flat if both control points are within
+ * the flattening tolerance of the line from start to end.
+ */
+static bool is_curve_flat(int32_t x0, int32_t y0,
+                          int32_t x1, int32_t y1,
+                          int32_t x2, int32_t y2,
+                          int32_t x3, int32_t y3,
+                          int32_t flattening)
+{
+    int32_t flat_sq = flattening * flattening;
+
+    /* Check distance of both control points from the line P0-P3 */
+    int32_t d1_sq = point_line_distance_squared(x1, y1, x0, y0, x3, y3);
+    int32_t d2_sq = point_line_distance_squared(x2, y2, x0, y0, x3, y3);
+
+    return (d1_sq <= flat_sq) && (d2_sq <= flat_sq);
+}
+
+
+/*
+ * Split a cubic Bezier curve at t=0.5 into two halves.
+ * Uses de Casteljau's algorithm.
+ * 
+ * Input:  P0, P1, P2, P3 - the original curve control points
+ * Output: left[0..3] - the first half of the curve
+ *         right[0..3] - the second half of the curve
+ * 
+ * Coordinates are in Draw units (fixed point with 8 fractional bits).
+ */
+static void split_bezier(int32_t x0, int32_t y0,
+                         int32_t x1, int32_t y1,
+                         int32_t x2, int32_t y2,
+                         int32_t x3, int32_t y3,
+                         int32_t *left_x, int32_t *left_y,
+                         int32_t *right_x, int32_t *right_y)
+{
+    int32_t q0x, q0y, q1x, q1y, q2x, q2y, r0x, r0y, r1x, r1y, sx, sy;
+
+    /* First level of interpolation - midpoints of control polygon edges */
+    q0x = (x0 + x1) / 2;
+    q0y = (y0 + y1) / 2;
+    q1x = (x1 + x2) / 2;
+    q1y = (y1 + y2) / 2;
+    q2x = (x2 + x3) / 2;
+    q2y = (y2 + y3) / 2;
+
+    /* Second level - midpoints of the q points */
+    r0x = (q0x + q1x) / 2;
+    r0y = (q0y + q1y) / 2;
+    r1x = (q1x + q2x) / 2;
+    r1y = (q1y + q2y) / 2;
+
+    /* Third level - the point on the curve at t=0.5 */
+    sx = (r0x + r1x) / 2;
+    sy = (r0y + r1y) / 2;
+
+    /* Left curve: P0, q0, r0, s */
+    left_x[0] = x0;  left_y[0] = y0;
+    left_x[1] = q0x; left_y[1] = q0y;
+    left_x[2] = r0x; left_y[2] = r0y;
+    left_x[3] = sx;  left_y[3] = sy;
+
+    /* Right curve: s, r1, q2, P3 */
+    right_x[0] = sx;  right_y[0] = sy;
+    right_x[1] = r1x; right_y[1] = r1y;
+    right_x[2] = q2x; right_y[2] = q2y;
+    right_x[3] = x3;  right_y[3] = y3;
+}
+
+
+/*
+ * Forward declaration for recursive function
+ */
+static void flatten_bezier_recursive(int32_t x0, int32_t y0,
+                                     int32_t x1, int32_t y1,
+                                     int32_t x2, int32_t y2,
+                                     int32_t x3, int32_t y3,
+                                     int32_t flattening,
+                                     Draw_PathElement **outpath,
+                                     int32_t *space_remaining,
+                                     bool *first_point);
+
+
+/*
+ * Recursively flatten a Bezier curve into line segments.
+ * Uses recursive subdivision until the curve is flat enough.
+ */
+static void flatten_bezier_recursive(int32_t x0, int32_t y0,
+                                     int32_t x1, int32_t y1,
+                                     int32_t x2, int32_t y2,
+                                     int32_t x3, int32_t y3,
+                                     int32_t flattening,
+                                     Draw_PathElement **outpath,
+                                     int32_t *space_remaining,
+                                     bool *first_point)
+{
+    int32_t left_x[4], left_y[4];
+    int32_t right_x[4], right_y[4];
+
+    /* Check if we have enough space for at least a LineTo (3 words) */
+    if (*space_remaining < 3 * sizeof(int32_t))
+    {
+        return;  /* No more space */
+    }
+
+    if (is_curve_flat(x0, y0, x1, y1, x2, y2, x3, y3, flattening))
+    {
+        /* Curve is flat enough - emit a line to the endpoint */
+        /* Only emit if this isn't the first point (no line needed) */
+        if (!*first_point)
+        {
+            (*outpath)->tag = Draw_LineTo;
+            (*outpath)->data.line_to.x = x3;
+            (*outpath)->data.line_to.y = y3;
+            *outpath = (Draw_PathElement *)(((int32_t*)*outpath) + 3);
+            *space_remaining -= 3 * sizeof(int32_t);
+        }
+        else
+        {
+            *first_point = false;
+        }
+    }
+    else
+    {
+        /* Curve needs more subdivision */
+        split_bezier(x0, y0, x1, y1, x2, y2, x3, y3,
+                     left_x, left_y, right_x, right_y);
+
+        /* Recursively flatten both halves */
+        flatten_bezier_recursive(left_x[0], left_y[0],
+                                 left_x[1], left_y[1],
+                                 left_x[2], left_y[2],
+                                 left_x[3], left_y[3],
+                                 flattening, outpath, space_remaining, first_point);
+
+        flatten_bezier_recursive(right_x[0], right_y[0],
+                                 right_x[1], right_y[1],
+                                 right_x[2], right_y[2],
+                                 right_x[3], right_y[3],
+                                 flattening, outpath, space_remaining, first_point);
+    }
+}
+
+
+/*
+ * Flatten a Bezier curve into line segments.
+ * 
+ * x0, y0 - start point (current position)
+ * x1, y1 - first control point
+ * x2, y2 - second control point
+ * x3, y3 - end point
+ * flattening - maximum deviation from the curve
+ * outpath - pointer to output path pointer
+ * space_remaining - pointer to remaining space in output buffer
+ */
+static void flatten_bezier(int32_t x0, int32_t y0,
+                           int32_t x1, int32_t y1,
+                           int32_t x2, int32_t y2,
+                           int32_t x3, int32_t y3,
+                           int32_t flattening,
+                           Draw_PathElement **outpath,
+                           int32_t *space_remaining)
+{
+    bool first_point = true;  /* Don't draw a line to the start point */
+
+    flatten_bezier_recursive(x0, y0, x1, y1, x2, y2, x3, y3,
+                             flattening, outpath, space_remaining, &first_point);
+}
+
+
+/*
+ * Flatten a path, converting Bezier curves to line segments.
+ * 
+ * inpath - input path containing MoveTo, LineTo, BezierTo elements
+ * outpath - output path buffer (starts with EndPath indicating available space)
+ * flattening - maximum deviation allowed for flattened curves
+ */
+void flatten(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t flattening)
+{
+    /* Read the initial space available from the EndPath element */
+    int32_t space_remaining = outpath->data.end_path;
+
+    /* Track current position for Bezier flattening */
+    int32_t current_x = 0;
+    int32_t current_y = 0;
+    bool have_current_pos = false;
+
+    /* Process input path elements */
+    while (inpath->tag != Draw_EndPath)
+    {
+        switch (inpath->tag)
+        {
+            case Draw_MoveTo:
+                /* Copy MoveTo to output if we have space */
+                if (space_remaining >= 3 * sizeof(int32_t))
+                {
+                    outpath->tag = Draw_MoveTo;
+                    outpath->data.move_to.x = inpath->data.move_to.x;
+                    outpath->data.move_to.y = inpath->data.move_to.y;
+                    outpath = (Draw_PathElement *)(((int32_t*)outpath) + 3);
+                    space_remaining -= 3 * sizeof(int32_t);
+
+                    /* Update current position */
+                    current_x = inpath->data.move_to.x;
+                    current_y = inpath->data.move_to.y;
+                    have_current_pos = true;
+                }
+                inpath = (Draw_PathElement *)(((int32_t*)inpath) + 3);
+                break;
+
+            case Draw_LineTo:
+                /* Copy LineTo to output if we have space */
+                if (space_remaining >= 3 * sizeof(int32_t))
+                {
+                    outpath->tag = Draw_LineTo;
+                    outpath->data.line_to.x = inpath->data.line_to.x;
+                    outpath->data.line_to.y = inpath->data.line_to.y;
+                    outpath = (Draw_PathElement *)(((int32_t*)outpath) + 3);
+                    space_remaining -= 3 * sizeof(int32_t);
+
+                    /* Update current position */
+                    current_x = inpath->data.line_to.x;
+                    current_y = inpath->data.line_to.y;
+                    have_current_pos = true;
+                }
+                inpath = (Draw_PathElement *)(((int32_t*)inpath) + 3);
+                break;
+
+            case Draw_BezierTo:
+                /* Flatten the Bezier curve into line segments */
+                if (have_current_pos && space_remaining >= 3 * sizeof(int32_t))
+                {
+                    flatten_bezier(current_x, current_y,
+                                   inpath->data.bezier_to[0].x,
+                                   inpath->data.bezier_to[0].y,
+                                   inpath->data.bezier_to[1].x,
+                                   inpath->data.bezier_to[1].y,
+                                   inpath->data.bezier_to[2].x,
+                                   inpath->data.bezier_to[2].y,
+                                   flattening,
+                                   &outpath,
+                                   &space_remaining);
+
+                    /* Update current position to the end of the curve */
+                    current_x = inpath->data.bezier_to[2].x;
+                    current_y = inpath->data.bezier_to[2].y;
+                }
+                inpath = (Draw_PathElement *)(((int32_t*)inpath) + 7);
+                break;
+
+            default:
+                /* Unknown element - skip it */
+                inpath = (Draw_PathElement *)(((int32_t*)inpath) + 1);
+                break;
+        }
+    }
+
+    /* Write the EndPath element with remaining space */
+    outpath->tag = Draw_EndPath;
+    outpath->data.end_path = space_remaining;
+}

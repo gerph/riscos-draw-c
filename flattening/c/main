@@ -1,7 +1,7 @@
 /*******************************************************************
  * File:        main
  * Purpose:     DrawFlattening command line tool
- * Author:      YOUR NAME
+ * Author:      Charles Ferguson
  ******************************************************************/
 
 #include <stdlib.h>
@@ -11,6 +11,7 @@
 #include "VersionNum"
 
 #include "types.h"
+#include "flatten.h"
 
 int32_t in_buffer[256];
 int32_t out_buffer[256];

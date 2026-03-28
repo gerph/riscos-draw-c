@@ -1,0 +1,23 @@
+/*******************************************************************
+ * File:     flatten
+ * Purpose:  Flatten Bezier curves in a Draw path into line segments
+ * Author:   Charles Ferguson
+ ******************************************************************/
+
+#ifndef FLATTEN_H
+#define FLATTEN_H
+
+#include "types.h"
+
+
+/*
+ * Flatten a path, converting Bezier curves to line segments.
+ * 
+ * inpath - input path containing MoveTo, LineTo, BezierTo elements
+ * outpath - output path buffer (starts with EndPath indicating available space)
+ * flattening - maximum deviation allowed for flattened curves
+ */
+void flatten(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t flattening);
+
+
+#endif
