@@ -55,6 +55,142 @@ void show_path(Draw_PathElement *path)
 }
 
 
+static int32_t iabs32(int32_t x)
+{
+    return x < 0 ? -x : x;
+}
+
+/* Recursively flatten a cubic Bezier segment using De Casteljau subdivision.
+ * P0 (x0,y0) is the current pen position; P1, P2 are control points; P3 is
+ * the endpoint. Emits LineTo elements into out, updating *space_remaining.
+ * Returns the updated out pointer.
+ */
+static Draw_PathElement *flatten_bezier(
+    int32_t x0, int32_t y0,
+    int32_t x1, int32_t y1,
+    int32_t x2, int32_t y2,
+    int32_t x3, int32_t y3,
+    Draw_PathElement *out,
+    int32_t *space_remaining,
+    int32_t flatness)
+{
+    int32_t ux = 2*x1 - x0 - x2;
+    int32_t uy = 2*y1 - y0 - y2;
+    int32_t vx = 2*x2 - x1 - x3;
+    int32_t vy = 2*y2 - y1 - y3;
+    int32_t d  = iabs32(ux) + iabs32(uy) + iabs32(vx) + iabs32(vy);
+
+    if (d <= 4 * flatness)
+    {
+        /* Flat enough: emit a LineTo to the endpoint */
+        if (*space_remaining >= (int32_t)(sizeof(int32_t) * 3))
+        {
+            out->tag = Draw_LineTo;
+            out->data.line_to.x = x3;
+            out->data.line_to.y = y3;
+            out = (Draw_PathElement *)(((int32_t *)out) + 3);
+            *space_remaining -= (int32_t)(sizeof(int32_t) * 3);
+        }
+    }
+    else
+    {
+        /* Subdivide at t=0.5 using De Casteljau's algorithm */
+        int32_t x01   = (x0  + x1)  / 2;
+        int32_t y01   = (y0  + y1)  / 2;
+        int32_t x12   = (x1  + x2)  / 2;
+        int32_t y12   = (y1  + y2)  / 2;
+        int32_t x23   = (x2  + x3)  / 2;
+        int32_t y23   = (y2  + y3)  / 2;
+        int32_t x012  = (x01 + x12) / 2;
+        int32_t y012  = (y01 + y12) / 2;
+        int32_t x123  = (x12 + x23) / 2;
+        int32_t y123  = (y12 + y23) / 2;
+        int32_t x0123 = (x012 + x123) / 2;
+        int32_t y0123 = (y012 + y123) / 2;
+
+        out = flatten_bezier(x0,    y0,    x01,  y01,  x012,  y012,  x0123, y0123,
+                             out, space_remaining, flatness);
+        out = flatten_bezier(x0123, y0123, x123, y123, x23,   y23,   x3,    y3,
+                             out, space_remaining, flatness);
+    }
+
+    return out;
+}
+
+
+/* Flatten a Draw path, converting BezierTo elements into LineTo sequences.
+ * inpath:   source path (read-only)
+ * outpath:  output buffer, initially holding a single EndPath whose end_path
+ *           field contains the number of bytes available after it
+ * flatness: maximum permitted deviation of a line from the true curve
+ */
+void flatten(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t flatness)
+{
+    Draw_PathElement *out = outpath;
+    int32_t space_remaining = outpath->data.end_path;
+    int32_t cur_x = 0;
+    int32_t cur_y = 0;
+
+    while (inpath->tag != Draw_EndPath)
+    {
+        switch (inpath->tag)
+        {
+            case Draw_MoveTo:
+                if (space_remaining >= (int32_t)(sizeof(int32_t) * 3))
+                {
+                    out->tag = Draw_MoveTo;
+                    out->data.move_to.x = inpath->data.move_to.x;
+                    out->data.move_to.y = inpath->data.move_to.y;
+                    out = (Draw_PathElement *)(((int32_t *)out) + 3);
+                    space_remaining -= (int32_t)(sizeof(int32_t) * 3);
+                }
+                cur_x = inpath->data.move_to.x;
+                cur_y = inpath->data.move_to.y;
+                inpath = (Draw_PathElement *)(((int32_t *)inpath) + 3);
+                break;
+
+            case Draw_LineTo:
+                if (space_remaining >= (int32_t)(sizeof(int32_t) * 3))
+                {
+                    out->tag = Draw_LineTo;
+                    out->data.line_to.x = inpath->data.line_to.x;
+                    out->data.line_to.y = inpath->data.line_to.y;
+                    out = (Draw_PathElement *)(((int32_t *)out) + 3);
+                    space_remaining -= (int32_t)(sizeof(int32_t) * 3);
+                }
+                cur_x = inpath->data.line_to.x;
+                cur_y = inpath->data.line_to.y;
+                inpath = (Draw_PathElement *)(((int32_t *)inpath) + 3);
+                break;
+
+            case Draw_BezierTo:
+            {
+                int32_t x1 = inpath->data.bezier_to[0].x;
+                int32_t y1 = inpath->data.bezier_to[0].y;
+                int32_t x2 = inpath->data.bezier_to[1].x;
+                int32_t y2 = inpath->data.bezier_to[1].y;
+                int32_t x3 = inpath->data.bezier_to[2].x;
+                int32_t y3 = inpath->data.bezier_to[2].y;
+                out = flatten_bezier(cur_x, cur_y, x1, y1, x2, y2, x3, y3,
+                                     out, &space_remaining, flatness);
+                cur_x = x3;
+                cur_y = y3;
+                inpath = (Draw_PathElement *)(((int32_t *)inpath) + 7);
+                break;
+            }
+
+            default:
+                inpath = (Draw_PathElement *)(((int32_t *)inpath) + 2);
+                break;
+        }
+    }
+
+    /* Write the closing EndPath element */
+    out->tag = Draw_EndPath;
+    out->data.end_path = space_remaining - (int32_t)(sizeof(int32_t) * 2);
+}
+
+
 void test_flattening(void)
 {
     Draw_PathElement *inpath = (Draw_PathElement *)in_buffer;
