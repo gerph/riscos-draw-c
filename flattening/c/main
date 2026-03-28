@@ -18,6 +18,109 @@ int32_t out_buffer[256];
 #define FLATTENING (16)
 
 
+void flatten_recursive(OS_Coord p0, OS_Coord p1, OS_Coord p2, OS_Coord p3, int32_t flattening, Draw_PathElement **outpath, int32_t *remaining_space, int depth)
+{
+    int32_t dx0, dy0, dx1, dy1;
+    OS_Coord l0, l1, l2, l3, r0, r1, r2, r3;
+    int32_t hx, hy;
+
+    if (depth > 10) goto leaf;
+
+    dx0 = p0.x - 2 * p1.x + p2.x;
+    dy0 = p0.y - 2 * p1.y + p2.y;
+    dx1 = p1.x - 2 * p2.x + p3.x;
+    dy1 = p1.y - 2 * p2.y + p3.y;
+
+    if (abs(dx0) + abs(dy0) + abs(dx1) + abs(dy1) < flattening)
+    {
+leaf:
+        if (*remaining_space >= 12)
+        {
+            (*outpath)->tag = Draw_LineTo;
+            (*outpath)->data.line_to = p3;
+            *outpath = (Draw_PathElement *)(((int32_t*)*outpath) + 3);
+            *remaining_space -= 12;
+        }
+    }
+    else
+    {
+        l0 = p0;
+        l1.x = (p0.x + p1.x) / 2;
+        l1.y = (p0.y + p1.y) / 2;
+        hx = (p1.x + p2.x) / 2;
+        hy = (p1.y + p2.y) / 2;
+        l2.x = (l1.x + hx) / 2;
+        l2.y = (l1.y + hy) / 2;
+        r3 = p3;
+        r2.x = (p2.x + p3.x) / 2;
+        r2.y = (p2.y + p3.y) / 2;
+        r1.x = (hx + r2.x) / 2;
+        r1.y = (hy + r2.y) / 2;
+        l3.x = r0.x = (l2.x + r1.x) / 2;
+        l3.y = r0.y = (l2.y + r1.y) / 2;
+
+        flatten_recursive(l0, l1, l2, l3, flattening, outpath, remaining_space, depth + 1);
+        flatten_recursive(r0, r1, r2, r3, flattening, outpath, remaining_space, depth + 1);
+    }
+}
+
+void flatten(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t flattening)
+{
+    int32_t total_space = outpath->data.end_path + 8;
+    int32_t remaining_space = total_space;
+    Draw_PathElement *curr_in = inpath;
+    Draw_PathElement *curr_out = outpath;
+    OS_Coord last_point = {0, 0};
+
+    while (curr_in->tag != Draw_EndPath)
+    {
+        switch (curr_in->tag)
+        {
+            case Draw_MoveTo:
+                if (remaining_space >= 12)
+                {
+                    curr_out->tag = Draw_MoveTo;
+                    curr_out->data.move_to = curr_in->data.move_to;
+                    last_point = curr_out->data.move_to;
+                    curr_out = (Draw_PathElement *)(((int32_t*)curr_out) + 3);
+                    remaining_space -= 12;
+                }
+                curr_in = (Draw_PathElement *)(((int32_t*)curr_in) + 3);
+                break;
+
+            case Draw_LineTo:
+                if (remaining_space >= 12)
+                {
+                    curr_out->tag = Draw_LineTo;
+                    curr_out->data.line_to = curr_in->data.line_to;
+                    last_point = curr_out->data.line_to;
+                    curr_out = (Draw_PathElement *)(((int32_t*)curr_out) + 3);
+                    remaining_space -= 12;
+                }
+                curr_in = (Draw_PathElement *)(((int32_t*)curr_in) + 3);
+                break;
+
+            case Draw_BezierTo:
+                flatten_recursive(last_point, curr_in->data.bezier_to[0], curr_in->data.bezier_to[1], curr_in->data.bezier_to[2], flattening, &curr_out, &remaining_space, 0);
+                last_point = curr_in->data.bezier_to[2];
+                curr_in = (Draw_PathElement *)(((int32_t*)curr_in) + 7);
+                break;
+
+            default:
+                /* Handle other tags (like Close) if necessary, but skipping for now as per requirements */
+                goto end_loop;
+                break;
+        }
+    }
+
+end_loop:
+    if (remaining_space >= 8)
+    {
+        curr_out->tag = Draw_EndPath;
+        curr_out->data.end_path = remaining_space - 8;
+    }
+}
+
 void show_path(Draw_PathElement *path)
 {
     while (path->tag != Draw_EndPath)
