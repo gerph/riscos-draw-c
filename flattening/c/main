@@ -7,6 +7,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
+
+#include "swis.h"
 
 #include "VersionNum"
 
@@ -16,6 +19,16 @@ int32_t in_buffer[256];
 int32_t out_buffer[256];
 
 #define FLATTENING (16)
+#define THICKNESS  (4)
+
+/* Simple line drawing for manual debug */
+#define MOVE(_x,_y) _swix(OS_Plot, _INR(0,2), 4, _x,_y)
+#define DRAW(_x,_y) _swix(OS_Plot, _INR(0,2), 5, _x,_y)
+#define WAIT() _swix(OS_ReadC,0)
+
+/* Scaling for our diagram */
+#define X(_x) ((_x)/64)
+#define Y(_y) ((_y)/64)
 
 
 void flatten_recursive(OS_Coord p0, OS_Coord p1, OS_Coord p2, OS_Coord p3, int32_t flattening, Draw_PathElement **outpath, int32_t *remaining_space, int depth)
@@ -129,11 +142,13 @@ void show_path(Draw_PathElement *path)
         {
             case Draw_MoveTo:
                 printf("MoveTo &%06x, &%06x\n", path->data.move_to.x, path->data.move_to.y);
+                MOVE(X(path->data.move_to.x), Y(path->data.move_to.y));
                 path = (Draw_PathElement *)(((int32_t*)path) + 3);
                 break;
 
             case Draw_LineTo:
                 printf("LineTo &%06x, &%06x\n", path->data.line_to.x, path->data.line_to.y);
+                DRAW(X(path->data.line_to.x), Y(path->data.line_to.y));
                 path = (Draw_PathElement *)(((int32_t*)path) + 3);
                 break;
 
@@ -142,6 +157,11 @@ void show_path(Draw_PathElement *path)
                        path->data.bezier_to[0].x, path->data.bezier_to[0].y,
                        path->data.bezier_to[1].x, path->data.bezier_to[1].y,
                        path->data.bezier_to[2].x, path->data.bezier_to[2].y);
+
+                DRAW(X(path->data.bezier_to[0].x), Y(path->data.bezier_to[0].y));
+                DRAW(X(path->data.bezier_to[1].x), Y(path->data.bezier_to[1].y));
+                DRAW(X(path->data.bezier_to[2].x), Y(path->data.bezier_to[2].y));
+
                 path = (Draw_PathElement *)(((int32_t*)path) + 7);
                 break;
 
@@ -204,7 +224,17 @@ void test_flattening(void)
 
     flatten(inpath, outpath, FLATTENING);
 
+    /* Reset things so that we can do thickening */
+    memcpy(in_buffer, out_buffer, sizeof(out_buffer));
+    outpath = (Draw_PathElement *)out_buffer;
+    ADD_END(outpath, sizeof(out_buffer) - sizeof(int32_t)*2);
+    outpath = (Draw_PathElement *)out_buffer;
+
+    thicken(inpath, outpath, THICKNESS);
+
     show_path(outpath);
+    if (getenv("WAIT") != NULL)
+        WAIT();
 }
 
 int main(int argc, char *argv[])
