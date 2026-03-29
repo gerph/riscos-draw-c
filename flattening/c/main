@@ -15,11 +15,230 @@
 
 #include "types.h"
 
-int32_t in_buffer[256];
-int32_t out_buffer[256];
+int32_t in_buffer[4096];
+int32_t out_buffer[4096];
 
-#define FLATTENING (16)
-#define THICKNESS  (4)
+#define FLATTENING (128)
+#define THICKNESS  (512)
+
+/* Integer square root for 32-bit values */
+static uint32_t isqrt32(uint32_t n)
+{
+    uint32_t res = 0;
+    uint32_t bit = 1 << 30;
+    while (bit > n) bit >>= 2;
+    while (bit != 0)
+    {
+        if (n >= res + bit)
+        {
+            n -= res + bit;
+            res = (res >> 1) + bit;
+        }
+        else
+        {
+            res >>= 1;
+        }
+        bit >>= 2;
+    }
+    return res;
+}
+
+/* Euclidean distance with overflow protection for 32-bit */
+static uint32_t hypot32(int32_t x, int32_t y)
+{
+    uint32_t ux = (uint32_t)(x < 0 ? -x : x);
+    uint32_t uy = (uint32_t)(y < 0 ? -y : y);
+    uint32_t max = ux > uy ? ux : uy;
+    uint32_t min = ux > uy ? uy : ux;
+    if (max == 0) return 0;
+    if (max > 0x8000) {
+        /* Scale down to avoid overflow in squaring (0x8000^2 fits in 32-bit) */
+        return 4 * isqrt32((max/4)*(max/4) + (min/4)*(min/4));
+    }
+    return isqrt32(max*max + min*min);
+}
+
+static int32_t div_round(int32_t num, int32_t den)
+{
+    if (den == 0) return 0;
+    if (den < 0) { num = -num; den = -den; }
+    if (num >= 0) return (num + den / 2) / den;
+    return (num - den / 2) / den;
+}
+
+#define S 16384 /* Scaling factor for unit vectors (2^14) */
+
+typedef struct {
+    int32_t nx, ny; /* Normalized normal components scaled by S */
+    uint32_t L;     /* Segment length */
+} SegmentInfo;
+
+static void thicken_subpath(OS_Coord *points, int n, int32_t thickness, Draw_PathElement **outpath, int32_t *remaining_space)
+{
+    static SegmentInfo segs[1024];
+    static OS_Coord left_points[1024];
+    static OS_Coord right_points[1024];
+    int i;
+    int32_t half_t = thickness / 2;
+
+    if (n < 2) return;
+    if (n > 1024) n = 1024;
+
+    for (i = 0; i < n - 1; i++) {
+        int32_t dx = points[i+1].x - points[i].x;
+        int32_t dy = points[i+1].y - points[i].y;
+        segs[i].L = hypot32(dx, dy);
+        if (segs[i].L == 0) {
+            segs[i].nx = 0;
+            segs[i].ny = 0;
+            segs[i].L = 1;
+        } else {
+            /* Normal is (-dy, dx) scaled by S */
+            segs[i].nx = div_round(-dy * S, (int32_t)segs[i].L);
+            segs[i].ny = div_round(dx * S, (int32_t)segs[i].L);
+        }
+    }
+
+    /* Start point (butt cap) */
+    {
+        int32_t ox = div_round(half_t * segs[0].nx, S);
+        int32_t oy = div_round(half_t * segs[0].ny, S);
+        left_points[0].x = points[0].x + ox;
+        left_points[0].y = points[0].y + oy;
+        right_points[0].x = points[0].x - ox;
+        right_points[0].y = points[0].y - oy;
+    }
+
+    /* Intermediate points (miter join) */
+    for (i = 1; i < n - 1; i++) {
+        /* Miter formula: Offset = (T/2) * (n1 + n2) / (1 + n1.n2) */
+        int32_t dot = (segs[i-1].nx * segs[i].nx + segs[i-1].ny * segs[i].ny) / S;
+        int32_t den = S + dot;
+        if (den < S/16) {
+            /* Sharp turn back, fallback to simple offset from previous segment */
+            int32_t ox = div_round(half_t * segs[i-1].nx, S);
+            int32_t oy = div_round(half_t * segs[i-1].ny, S);
+            left_points[i].x = points[i].x + ox;
+            left_points[i].y = points[i].y + oy;
+            right_points[i].x = points[i].x - ox;
+            right_points[i].y = points[i].y - oy;
+        } else {
+            int32_t num_x = half_t * (segs[i-1].nx + segs[i].nx);
+            int32_t num_y = half_t * (segs[i-1].ny + segs[i].ny);
+            left_points[i].x = points[i].x + div_round(num_x, den);
+            left_points[i].y = points[i].y + div_round(num_y, den);
+            right_points[i].x = points[i].x - div_round(num_x, den);
+            right_points[i].y = points[i].y - div_round(num_y, den);
+        }
+    }
+
+    /* End point (butt cap) */
+    {
+        int32_t ox = div_round(half_t * segs[n-2].nx, S);
+        int32_t oy = div_round(half_t * segs[n-2].ny, S);
+        left_points[n-1].x = points[n-1].x + ox;
+        left_points[n-1].y = points[n-1].y + oy;
+        right_points[n-1].x = points[n-1].x - ox;
+        right_points[n-1].y = points[n-1].y - oy;
+    }
+
+    /* Closed loop join */
+    if (points[0].x == points[n-1].x && points[0].y == points[n-1].y && n > 2) {
+        int32_t dot = (segs[n-2].nx * segs[0].nx + segs[n-2].ny * segs[0].ny) / S;
+        int32_t den = S + dot;
+        if (den >= S/16) {
+            int32_t num_x = half_t * (segs[n-2].nx + segs[0].nx);
+            int32_t num_y = half_t * (segs[n-2].ny + segs[0].ny);
+            left_points[0].x = points[0].x + div_round(num_x, den);
+            left_points[0].y = points[0].y + div_round(num_y, den);
+            right_points[0].x = points[0].x - div_round(num_x, den);
+            right_points[0].y = points[0].y - div_round(num_y, den);
+            left_points[n-1] = left_points[0];
+            right_points[n-1] = right_points[0];
+        }
+    }
+
+    /* Output L-path -> R-path (closed loop) */
+    if (*remaining_space >= 12) {
+        (*outpath)->tag = Draw_MoveTo;
+        (*outpath)->data.move_to = left_points[0];
+        *outpath = (Draw_PathElement *)(((int32_t*)*outpath) + 3);
+        *remaining_space -= 12;
+    }
+
+    for (i = 1; i < n; i++) {
+        if (*remaining_space >= 12) {
+            (*outpath)->tag = Draw_LineTo;
+            (*outpath)->data.line_to = left_points[i];
+            *outpath = (Draw_PathElement *)(((int32_t*)*outpath) + 3);
+            *remaining_space -= 12;
+        }
+    }
+
+    for (i = n - 1; i >= 0; i--) {
+        if (*remaining_space >= 12) {
+            (*outpath)->tag = Draw_LineTo;
+            (*outpath)->data.line_to = right_points[i];
+            *outpath = (Draw_PathElement *)(((int32_t*)*outpath) + 3);
+            *remaining_space -= 12;
+        }
+    }
+
+    if (*remaining_space >= 12) {
+        (*outpath)->tag = Draw_LineTo;
+        (*outpath)->data.line_to = left_points[0];
+        *outpath = (Draw_PathElement *)(((int32_t*)*outpath) + 3);
+        *remaining_space -= 12;
+    }
+}
+
+void thicken(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickness)
+{
+    int32_t total_space = outpath->data.end_path + 8;
+    int32_t remaining_space = total_space;
+    Draw_PathElement *curr_in = inpath;
+    Draw_PathElement *curr_out = outpath;
+    
+    static OS_Coord points[1024];
+    int num_points = 0;
+
+    while (curr_in->tag != Draw_EndPath)
+    {
+        switch (curr_in->tag)
+        {
+            case Draw_MoveTo:
+                if (num_points > 1)
+                {
+                    thicken_subpath(points, num_points, thickness, &curr_out, &remaining_space);
+                }
+                num_points = 0;
+                points[num_points++] = curr_in->data.move_to;
+                curr_in = (Draw_PathElement *)(((int32_t*)curr_in) + 3);
+                break;
+
+            case Draw_LineTo:
+                if (num_points < 1024)
+                    points[num_points++] = curr_in->data.line_to;
+                curr_in = (Draw_PathElement *)(((int32_t*)curr_in) + 3);
+                break;
+
+            default:
+                goto end_loop;
+        }
+    }
+
+end_loop:
+    if (num_points > 1)
+    {
+        thicken_subpath(points, num_points, thickness, &curr_out, &remaining_space);
+    }
+
+    if (remaining_space >= 8)
+    {
+        curr_out->tag = Draw_EndPath;
+        curr_out->data.end_path = remaining_space - 8;
+    }
+}
 
 /* Simple line drawing for manual debug */
 #define MOVE(_x,_y) _swix(OS_Plot, _INR(0,2), 4, _x,_y)
@@ -233,8 +452,10 @@ void test_flattening(void)
     thicken(inpath, outpath, THICKNESS);
 
     show_path(outpath);
+#if 0
     if (getenv("WAIT") != NULL)
         WAIT();
+#endif
 }
 
 int main(int argc, char *argv[])
