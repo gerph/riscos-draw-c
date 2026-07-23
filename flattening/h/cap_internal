@@ -1,0 +1,45 @@
+/*******************************************************************
+ * File:     cap_internal
+ * Purpose:  Cap geometry shared between c.cap and c.thicken only - not
+ *           part of the public API in h.cap
+ * Author:   Gerph
+ * Date:     23 Jul 2026
+ ******************************************************************/
+
+#ifndef CAP_INTERNAL_H
+#define CAP_INTERNAL_H
+
+#include "types.h"
+#include "bufferdata.h"
+#include "geometry.h"
+
+/*************************************************** Gerph *********
+ Function:      cap_emit
+ Description:   Emit the geometry for one line cap. 'from' has already been
+                written by the caller; this always finishes by writing 'to'
+                itself, so the writer's position ends up exactly there
+                regardless of style - callers don't need to special-case
+                the butt style.
+ Parameters:    buf-> the path writer
+                from = the point already written, one side of the cap
+                to = the point this must finish having written, the other
+                     side of the cap
+                P = the path endpoint the cap surrounds
+                perp = the unit normal with from == P + half_thick*perp (so
+                       to == P - half_thick*perp)
+                dir = the unit direction the cap projects into, away from
+                      the stroked line (ie outward continuation for an end
+                      cap, backward continuation for a start cap)
+                half_thick = half the line thickness
+                style = the Draw_CapStyle to draw
+                width_256, length_256 = Draw_LineStyle's triangular cap
+                                        settings, in 256ths of the line
+                                        width (ie 2*half_thick)
+ Returns:       none
+ ******************************************************************/
+void cap_emit(bufferdata_t *buf,
+              Vec2 from, Vec2 to, Vec2 P, Vec2 perp, Vec2 dir,
+              double half_thick, Draw_CapStyle style,
+              int32_t width_256, int32_t length_256);
+
+#endif

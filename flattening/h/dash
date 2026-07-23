@@ -1,0 +1,44 @@
+/*******************************************************************
+ * File:     dash
+ * Purpose:  Splitting a flattened Draw path into on/off runs following a
+ *           dash pattern
+ * Author:   Gerph
+ * Date:     23 Jul 2026
+ ******************************************************************/
+
+#ifndef DASH_H
+#define DASH_H
+
+#include "types.h"
+
+/*************************************************** Gerph *********
+ Function:      dash
+ Description:   Apply a dash pattern to a flattened path, replacing "off"
+                sections with GapTo elements rather than separate subpaths,
+                exactly matching Draw's own definition of a gap ("do not
+                start a new subpath") - this keeps a single subpath's
+                Move/Close structure intact through dashing, and is exactly
+                what thicken() already knows how to stroke (it treats
+                GapTo, and a CloseGap's closing edge, as unstroked breaks).
+
+                A closed subpath's closing edge is walked as part of the
+                same pattern if it is a CloseLine (a CloseGap's closing
+                edge is never drawn, so it is excluded, just as it is when
+                thickening). The pattern is not specially re-synchronised
+                at that seam: as with most vector renderers, the dash run
+                that reaches back round to the start point is simply capped
+                there like any other, rather than merged with the first
+                run.
+ Parameters:    inpath-> source path (read-only), already flattened
+                outpath-> output buffer, initially holding a single EndPath
+                          whose end_path field contains the number of bytes
+                          available after it
+                pattern-> the dash pattern to apply, or NULL for no dashes,
+                          in which case the path is copied through
+                          unchanged (matching Draw's own R6=0 convention of
+                          "no dashes")
+ Returns:       the standard RISC OS space-report - see path_write_result()
+ ******************************************************************/
+int32_t dash(Draw_PathElement *inpath, Draw_PathElement *outpath, Draw_DashPattern *pattern);
+
+#endif

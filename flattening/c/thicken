@@ -1,0 +1,353 @@
+/*******************************************************************
+ * File:        thicken
+ * Purpose:     Converting a flattened (and optionally dashed) Draw path
+ *              into a filled outline path of a given thickness
+ * Author:      Gerph
+ ******************************************************************/
+
+#include <string.h>
+#include <math.h>
+#include <stddef.h>
+
+#include "thicken.h"
+#include "thicken_internal.h"
+#include "cap_internal.h"
+#include "geometry.h"
+#include "pathio.h"
+
+/* Ratio of mitre length to line width beyond which a corner is bevelled
+ * instead of mitred, matching the sense of Draw_LineStyle's mitre_limit. */
+#define THICKEN_MITRE_LIMIT (4.0)
+
+/* Compute the offset outline point(s) needed at a vertex V where the path
+ * turns from unit direction dir_in to dir_out, on one side of the line
+ * (side_sign, as per offset_point). Writes 1 point to out[] for a straight
+ * run or a mitre join within the limit, or 2 points for a bevelled join
+ * (including the degenerate cusp where the path doubles back on itself).
+ * Returns the number of points written.
+ */
+static int join_points(Vec2 V, Vec2 dir_in, Vec2 dir_out,
+                        double side_sign, double half_thick, double mitre_limit,
+                        Vec2 *out)
+{
+    Vec2 p_in  = offset_point(V, dir_in,  side_sign, half_thick);
+    Vec2 p_out = offset_point(V, dir_out, side_sign, half_thick);
+    double cross = dir_in.x * dir_out.y - dir_in.y * dir_out.x;
+    double dot   = dir_in.x * dir_out.x + dir_in.y * dir_out.y;
+
+    if (fabs(cross) < 1e-6)
+    {
+        if (dot > 0.0)
+        {
+            /* Directions unchanged: both offsets coincide */
+            out[0] = p_out;
+            return 1;
+        }
+
+        /* Path reverses on itself: no sensible mitre, bevel across the cusp */
+        out[0] = p_in;
+        out[1] = p_out;
+        return 2;
+    }
+
+    {
+        Vec2 diff;
+        double t;
+        Vec2 mitre;
+        double mitre_length;
+
+        diff.x = p_out.x - p_in.x;
+        diff.y = p_out.y - p_in.y;
+        t = (diff.x * dir_out.y - diff.y * dir_out.x) / cross;
+        mitre.x = p_in.x + t * dir_in.x;
+        mitre.y = p_in.y + t * dir_in.y;
+        mitre_length = sqrt((mitre.x - V.x) * (mitre.x - V.x) +
+                             (mitre.y - V.y) * (mitre.y - V.y));
+
+        if (mitre_length <= mitre_limit * 2.0 * half_thick)
+        {
+            out[0] = mitre;
+            return 1;
+        }
+    }
+
+    /* Corner too sharp for a mitre within the limit: bevel it off */
+    out[0] = p_in;
+    out[1] = p_out;
+    return 2;
+}
+
+/* Compute one side's offset polyline for an open subpath: the two ends are
+ * flush (square, butt-cap) offsets of their single adjoining segment, and
+ * interior vertices are joined with join_points(). out[] must have room for
+ * up to 2 points per vertex.
+ */
+static int32_t side_offset_open(Subpath *sp, double side_sign, double half_thick, Vec2 *out)
+{
+    int32_t n = sp->count;
+    int32_t m = 0;
+    int32_t i;
+
+    for (i = 0; i < n; i++)
+    {
+        Vec2 V = coord_to_vec(sp->pts[i]);
+
+        if (i == 0)
+        {
+            Vec2 dir = unit_dir(sp->pts[0], sp->pts[1]);
+            out[m++] = offset_point(V, dir, side_sign, half_thick);
+        }
+        else if (i == n - 1)
+        {
+            Vec2 dir = unit_dir(sp->pts[n - 2], sp->pts[n - 1]);
+            out[m++] = offset_point(V, dir, side_sign, half_thick);
+        }
+        else
+        {
+            Vec2 dir_in  = unit_dir(sp->pts[i - 1], sp->pts[i]);
+            Vec2 dir_out = unit_dir(sp->pts[i], sp->pts[i + 1]);
+            Vec2 joined[2];
+            int32_t c = join_points(V, dir_in, dir_out, side_sign, half_thick,
+                                     THICKEN_MITRE_LIMIT, joined);
+            int32_t k;
+            for (k = 0; k < c; k++)
+                out[m++] = joined[k];
+        }
+    }
+
+    return m;
+}
+
+/* As side_offset_open, but every vertex wraps around to its neighbours -
+ * there are no flush ends, since a closed subpath has no loose ends.
+ */
+static int32_t side_offset_closed(Subpath *sp, double side_sign, double half_thick, Vec2 *out)
+{
+    int32_t n = sp->count;
+    int32_t m = 0;
+    int32_t i;
+
+    for (i = 0; i < n; i++)
+    {
+        Vec2 V = coord_to_vec(sp->pts[i]);
+        Vec2 dir_in  = unit_dir(sp->pts[(i - 1 + n) % n], sp->pts[i]);
+        Vec2 dir_out = unit_dir(sp->pts[i], sp->pts[(i + 1) % n]);
+        Vec2 joined[2];
+        int32_t c = join_points(V, dir_in, dir_out, side_sign, half_thick,
+                                 THICKEN_MITRE_LIMIT, joined);
+        int32_t k;
+        for (k = 0; k < c; k++)
+            out[m++] = joined[k];
+    }
+
+    return m;
+}
+
+/* Emit an open subpath as a single closed loop: out along the left offset,
+ * across to the right offset, back along the right offset, then closing
+ * back to the start. The end and start crossings are line caps - see
+ * cap_emit() - and are plain butt caps (a straight line across) when style
+ * is NULL, which is what thicken() below always passes; cap() passes a
+ * real style to get round/square/triangular caps instead.
+ */
+static void thicken_emit_open(Subpath *sp, double half_thick,
+                               Draw_LineStyle *style, bufferdata_t *buf)
+{
+    Vec2 left[2 * PATH_MAX_POINTS];
+    Vec2 right[2 * PATH_MAX_POINTS];
+    int32_t nl = side_offset_open(sp, 1.0, half_thick, left);
+    int32_t nr = side_offset_open(sp, -1.0, half_thick, right);
+    int32_t i;
+
+    if (nl < 1 || nr < 1)
+        return;
+
+    path_write_moveto(buf, vec_to_coord(left[0]));
+    for (i = 1; i < nl; i++)
+        path_write_lineto(buf, vec_to_coord(left[i]));
+
+    if (style != NULL)
+    {
+        /* End cap: the line was travelling in this direction when it
+         * reached its last point, and the cap projects further that way. */
+        Vec2 P = coord_to_vec(sp->pts[sp->count - 1]);
+        Vec2 dir = unit_dir(sp->pts[sp->count - 2], sp->pts[sp->count - 1]);
+        Vec2 perp;
+        perp.x = -dir.y;
+        perp.y = dir.x;
+        cap_emit(buf, left[nl - 1], right[nr - 1], P, perp, dir,
+                 half_thick, style->end_cap_style,
+                 style->end_cap_width, style->end_cap_length);
+    }
+    else
+        path_write_lineto(buf, vec_to_coord(right[nr - 1]));
+
+    for (i = nr - 2; i >= 0; i--)
+        path_write_lineto(buf, vec_to_coord(right[i]));
+
+    if (style != NULL)
+    {
+        /* Start cap: projects backwards, away from the direction the line
+         * heads off in from its first point. */
+        Vec2 P = coord_to_vec(sp->pts[0]);
+        Vec2 dir = unit_dir(sp->pts[0], sp->pts[1]);
+        Vec2 perp, out_dir;
+        perp.x = dir.y;
+        perp.y = -dir.x;
+        out_dir.x = -dir.x;
+        out_dir.y = -dir.y;
+        cap_emit(buf, right[0], left[0], P, perp, out_dir,
+                 half_thick, style->start_cap_style,
+                 style->start_cap_width, style->start_cap_length);
+    }
+
+    path_write_close(buf, Draw_CloseLine);
+}
+
+/* Emit a closed subpath as two closed rings, wound in opposite directions
+ * so a nonzero winding rule fills the band between them.
+ */
+static void thicken_emit_closed(Subpath *sp, double half_thick, bufferdata_t *buf)
+{
+    Vec2 left[2 * PATH_MAX_POINTS];
+    Vec2 right[2 * PATH_MAX_POINTS];
+    int32_t nl = side_offset_closed(sp, 1.0, half_thick, left);
+    int32_t nr = side_offset_closed(sp, -1.0, half_thick, right);
+    int32_t i;
+
+    if (nl >= 3)
+    {
+        path_write_moveto(buf, vec_to_coord(left[0]));
+        for (i = 1; i < nl; i++)
+            path_write_lineto(buf, vec_to_coord(left[i]));
+        path_write_close(buf, Draw_CloseLine);
+    }
+
+    if (nr >= 3)
+    {
+        path_write_moveto(buf, vec_to_coord(right[nr - 1]));
+        for (i = nr - 2; i >= 0; i--)
+            path_write_lineto(buf, vec_to_coord(right[i]));
+        path_write_close(buf, Draw_CloseLine);
+    }
+}
+
+static void gapped_path_add(GappedPath *gp, int32_t x, int32_t y, int32_t is_gap_edge)
+{
+    if (gp->count > 0 && !is_gap_edge &&
+        gp->pts[gp->count - 1].x == x && gp->pts[gp->count - 1].y == y)
+        return;
+
+    if (gp->count < PATH_MAX_POINTS)
+    {
+        gp->pts[gp->count].x = x;
+        gp->pts[gp->count].y = y;
+        gp->gap_before[gp->count] = (uint8_t)(is_gap_edge != 0);
+        gp->count++;
+    }
+}
+
+Draw_PathElement *thicken_read_gapped_subpath(Draw_PathElement *inpath, GappedPath *gp)
+{
+    gp->count = 0;
+
+    gapped_path_add(gp, inpath->data.move_to.x, inpath->data.move_to.y, 0);
+    inpath = advance_element(inpath);
+
+    while (inpath->tag == Draw_LineTo || inpath->tag == Draw_GapTo)
+    {
+        gapped_path_add(gp, inpath->data.line_to.x, inpath->data.line_to.y,
+                         inpath->tag == Draw_GapTo);
+        inpath = advance_element(inpath);
+    }
+
+    if (inpath->tag == Draw_CloseGap || inpath->tag == Draw_CloseLine)
+    {
+        if (gp->count > 0)
+            gapped_path_add(gp, gp->pts[0].x, gp->pts[0].y, inpath->tag == Draw_CloseGap);
+        inpath = advance_element(inpath);
+    }
+
+    return inpath;
+}
+
+void thicken_process_gapped(GappedPath *gp, double half_thick,
+                             Draw_LineStyle *style, bufferdata_t *buf)
+{
+    int32_t n = gp->count;
+    int32_t i;
+
+    if (n < 2)
+        return;
+
+    if (n >= 3)
+    {
+        int32_t any_gap = 0;
+        for (i = 1; i < n; i++)
+        {
+            if (gp->gap_before[i])
+            {
+                any_gap = 1;
+                break;
+            }
+        }
+
+        if (!any_gap &&
+            gp->pts[0].x == gp->pts[n - 1].x && gp->pts[0].y == gp->pts[n - 1].y)
+        {
+            Subpath ring;
+            ring.count = n - 1;
+            ring.close_tag = Draw_CloseLine;
+            memcpy(ring.pts, gp->pts, sizeof(OS_Coord) * ring.count);
+            thicken_emit_closed(&ring, half_thick, buf);
+            return;
+        }
+    }
+
+    {
+        int32_t run_start = 0;
+        for (i = 1; i <= n; i++)
+        {
+            if (i == n || gp->gap_before[i])
+            {
+                int32_t run_count = i - run_start;
+                if (run_count >= 2)
+                {
+                    Subpath run;
+                    run.count = run_count;
+                    memcpy(run.pts, gp->pts + run_start, sizeof(OS_Coord) * run_count);
+                    thicken_emit_open(&run, half_thick, style, buf);
+                }
+                run_start = i;
+            }
+        }
+    }
+}
+
+int32_t thicken(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickness)
+{
+    bufferdata_t buf;
+    double half_thick = thickness / 2.0;
+
+    path_writer_init(&buf, outpath);
+
+    while (inpath->tag != Draw_EndPath)
+    {
+        GappedPath gp;
+
+        if (inpath->tag != Draw_MoveTo && inpath->tag != Draw_SpecialMoveTo)
+        {
+            /* Not at the start of a subpath - skip the stray element */
+            inpath = advance_element(inpath);
+            continue;
+        }
+
+        inpath = thicken_read_gapped_subpath(inpath, &gp);
+
+        if (half_thick > 0.0)
+            thicken_process_gapped(&gp, half_thick, NULL, &buf);
+    }
+
+    path_write_endpath(&buf);
+    return path_write_result(&buf);
+}

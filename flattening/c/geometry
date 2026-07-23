@@ -1,0 +1,61 @@
+/*******************************************************************
+ * File:        geometry
+ * Purpose:     Small 2D vector helpers shared by the thickening, capping
+ *              and dashing stages
+ * Author:      Gerph
+ ******************************************************************/
+
+#include <math.h>
+
+#include "geometry.h"
+
+Vec2 coord_to_vec(OS_Coord p)
+{
+    Vec2 v;
+    v.x = (double)p.x;
+    v.y = (double)p.y;
+    return v;
+}
+
+static int32_t round_to_int32(double v)
+{
+    return (int32_t)(v >= 0.0 ? v + 0.5 : v - 0.5);
+}
+
+OS_Coord vec_to_coord(Vec2 v)
+{
+    OS_Coord p;
+    p.x = round_to_int32(v.x);
+    p.y = round_to_int32(v.y);
+    return p;
+}
+
+Vec2 unit_dir(OS_Coord a, OS_Coord b)
+{
+    double dx = (double)b.x - (double)a.x;
+    double dy = (double)b.y - (double)a.y;
+    double len = sqrt(dx * dx + dy * dy);
+    Vec2 v;
+
+    if (len < 1e-9)
+    {
+        v.x = 1.0;
+        v.y = 0.0;
+        return v;
+    }
+
+    v.x = dx / len;
+    v.y = dy / len;
+    return v;
+}
+
+Vec2 offset_point(Vec2 V, Vec2 dir, double side_sign, double half_thick)
+{
+    Vec2 n;
+    Vec2 p;
+    n.x = -dir.y;
+    n.y = dir.x;
+    p.x = V.x + side_sign * half_thick * n.x;
+    p.y = V.y + side_sign * half_thick * n.y;
+    return p;
+}

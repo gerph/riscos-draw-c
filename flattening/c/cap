@@ -1,0 +1,116 @@
+/*******************************************************************
+ * File:        cap
+ * Purpose:     Finishing a thickened line's open ends with a Draw line-cap
+ *              style (butt, round, projecting square or triangular)
+ * Author:      Gerph
+ ******************************************************************/
+
+#include <math.h>
+#include <stddef.h>
+
+#include "cap.h"
+#include "cap_internal.h"
+#include "thicken.h"
+#include "thicken_internal.h"
+#include "pathio.h"
+
+void cap_emit(bufferdata_t *buf,
+              Vec2 from, Vec2 to, Vec2 P, Vec2 perp, Vec2 dir,
+              double half_thick, Draw_CapStyle style,
+              int32_t width_256, int32_t length_256)
+{
+    double line_width = half_thick * 2.0;
+
+    switch (style)
+    {
+        case Draw_CapRound:
+        {
+            /* Semicircle from 'from', through the outward bulge, to 'to' -
+             * approximated with a handful of flat segments, matching the
+             * rest of this project's flatten-early approach. */
+            const int32_t STEPS = 8;
+            int32_t i;
+            for (i = 1; i < STEPS; i++)
+            {
+                double t = 3.14159265358979323846 * (double)i / (double)STEPS;
+                Vec2 p;
+                p.x = P.x + half_thick * (perp.x * cos(t) + dir.x * sin(t));
+                p.y = P.y + half_thick * (perp.y * cos(t) + dir.y * sin(t));
+                path_write_lineto(buf, vec_to_coord(p));
+            }
+            break;
+        }
+
+        case Draw_CapSquare:
+        {
+            /* Projects both shoulders out by half the line width, giving a
+             * flat cap that stands proud of the endpoint rather than
+             * sitting flush with it. */
+            Vec2 p1, p2;
+            p1.x = from.x + dir.x * half_thick;
+            p1.y = from.y + dir.y * half_thick;
+            p2.x = to.x   + dir.x * half_thick;
+            p2.y = to.y   + dir.y * half_thick;
+            path_write_lineto(buf, vec_to_coord(p1));
+            path_write_lineto(buf, vec_to_coord(p2));
+            break;
+        }
+
+        case Draw_CapTriangular:
+        {
+            /* An arrowhead-style point, with the base width and how far the
+             * apex stands away from the line both independently settable,
+             * as fractions of the line width. */
+            Vec2 base1, apex, base2;
+            double w = line_width * ((double)width_256 / 256.0);
+            double l = line_width * ((double)length_256 / 256.0);
+            base1.x = P.x + perp.x * w;
+            base1.y = P.y + perp.y * w;
+            apex.x  = P.x + dir.x * l;
+            apex.y  = P.y + dir.y * l;
+            base2.x = P.x - perp.x * w;
+            base2.y = P.y - perp.y * w;
+            path_write_lineto(buf, vec_to_coord(base1));
+            path_write_lineto(buf, vec_to_coord(apex));
+            path_write_lineto(buf, vec_to_coord(base2));
+            break;
+        }
+
+        case Draw_CapButt:
+        default:
+            break;
+    }
+
+    path_write_lineto(buf, vec_to_coord(to));
+}
+
+int32_t cap(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickness,
+            Draw_LineStyle *style)
+{
+    bufferdata_t buf;
+    double half_thick = thickness / 2.0;
+
+    if (style == NULL)
+        return thicken(inpath, outpath, thickness);
+
+    path_writer_init(&buf, outpath);
+
+    while (inpath->tag != Draw_EndPath)
+    {
+        GappedPath gp;
+
+        if (inpath->tag != Draw_MoveTo && inpath->tag != Draw_SpecialMoveTo)
+        {
+            inpath = advance_element(inpath);
+            continue;
+        }
+
+        inpath = thicken_read_gapped_subpath(inpath, &gp);
+
+        if (half_thick > 0.0)
+            thicken_process_gapped(&gp, half_thick, style, &buf);
+    }
+
+    path_write_endpath(&buf);
+    return path_write_result(&buf);
+}

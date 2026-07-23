@@ -1,0 +1,142 @@
+/*******************************************************************
+ * File:     pathio
+ * Purpose:  Reading and writing raw Draw_PathElement streams, shared by
+ *           the flattening, dashing, thickening and capping stages
+ * Author:   Gerph
+ * Date:     23 Jul 2026
+ ******************************************************************/
+
+#ifndef PATHIO_H
+#define PATHIO_H
+
+#include "types.h"
+#include "bufferdata.h"
+
+/* Maximum distinct vertices buffered for a single subpath while thickening
+ * or dashing. */
+#define PATH_MAX_POINTS (64)
+
+/*************************************************** Gerph *********
+ Function:      advance_element
+ Description:   Advance a path element pointer past 'e', according to how
+                many words that tag occupies on disk. Path elements are
+                variable length (eg a Close is a single word, a MoveTo is
+                three, a BezierTo is seven), so this must be used instead of
+                sizeof(Draw_PathElement) when walking a path.
+ Parameters:    e-> the path element to advance past
+ Returns:       pointer to the following path element
+ ******************************************************************/
+Draw_PathElement *advance_element(Draw_PathElement *e);
+
+/* A subpath's distinct vertices, read from a plain (undashed) path - ie one
+ * that cannot yet contain any GapTo elements. See GappedPath in thicken.h
+ * for the equivalent that can.
+ */
+typedef struct {
+    OS_Coord pts[PATH_MAX_POINTS];
+    int32_t  count;
+    Draw_Tag close_tag;   /* 0 (open), Draw_CloseLine or Draw_CloseGap */
+} Subpath;
+
+/*************************************************** Gerph *********
+ Function:      subpath_add_point
+ Description:   Append a point to a Subpath, skipping it if it exactly
+                repeats the previous one (a zero-length segment) - this
+                keeps degenerate input from producing zero-length
+                directions later on
+ Parameters:    sp-> the subpath to append to
+                x, y = the point to append
+ Returns:       none
+ ******************************************************************/
+void subpath_add_point(Subpath *sp, int32_t x, int32_t y);
+
+/*************************************************** Gerph *********
+ Function:      path_read_subpath
+ Description:   Read one subpath starting at inpath (which must be a MoveTo
+                or SpecialMoveTo and must not yet contain any GapTo elements
+                - ie this is for reading a plain, undashed path), collecting
+                its distinct vertices into sp
+ Parameters:    inpath-> the MoveTo/SpecialMoveTo starting the subpath
+                sp-> the subpath to fill in
+ Returns:       pointer to the element following the subpath (the next
+                MoveTo or the EndPath)
+ ******************************************************************/
+Draw_PathElement *path_read_subpath(Draw_PathElement *inpath, Subpath *sp);
+
+/*************************************************** Gerph *********
+ Function:      path_writer_init
+ Description:   Initialise a bufferdata_t to write a path into outpath.
+                outpath must already hold a single EndPath element whose
+                end_path field gives the number of bytes available after it
+                - the standard Draw module output-path convention - so the
+                writer's usable capacity is those bytes plus the two words
+                the placeholder itself occupies (which get overwritten by
+                whatever is written first)
+ Parameters:    buf-> the bufferdata_t to initialise
+                outpath-> the output buffer, holding a placeholder EndPath
+ Returns:       none
+ ******************************************************************/
+void path_writer_init(bufferdata_t *buf, Draw_PathElement *outpath);
+
+/*************************************************** Gerph *********
+ Function:      path_write_moveto
+ Description:   Write a MoveTo element
+ Parameters:    buf-> the path writer
+                p = the point to move to
+ Returns:       none
+ ******************************************************************/
+void path_write_moveto(bufferdata_t *buf, OS_Coord p);
+
+/*************************************************** Gerph *********
+ Function:      path_write_lineto
+ Description:   Write a LineTo element
+ Parameters:    buf-> the path writer
+                p = the point to draw a line to
+ Returns:       none
+ ******************************************************************/
+void path_write_lineto(bufferdata_t *buf, OS_Coord p);
+
+/*************************************************** Gerph *********
+ Function:      path_write_gapto
+ Description:   Write a GapTo element
+ Parameters:    buf-> the path writer
+                p = the point to move the gap to
+ Returns:       none
+ ******************************************************************/
+void path_write_gapto(bufferdata_t *buf, OS_Coord p);
+
+/*************************************************** Gerph *********
+ Function:      path_write_close
+ Description:   Write a subpath-closing element
+ Parameters:    buf-> the path writer
+                which = Draw_CloseLine or Draw_CloseGap
+ Returns:       none
+ ******************************************************************/
+void path_write_close(bufferdata_t *buf, Draw_Tag which);
+
+/*************************************************** Gerph *********
+ Function:      path_write_endpath
+ Description:   Write the terminating EndPath element. Unlike the writers
+                above, this does not mark a bufferdata "record" complete,
+                since it is metadata about the buffer rather than a path
+                element in its own right. Always safe to call even after a
+                failure: bufferdata_write_word never writes past the buffer
+                it was given.
+ Parameters:    buf-> the path writer
+ Returns:       none
+ ******************************************************************/
+void path_write_endpath(bufferdata_t *buf);
+
+/*************************************************** Gerph *********
+ Function:      path_write_result
+ Description:   Convert a path writer's final state into the standard RISC
+                OS space-report convention (see h.bufferdata's own usage
+                example): a positive result is the spare space left in the
+                buffer; a negative result is -(the space that would have
+                been required to succeed)
+ Parameters:    buf-> the path writer
+ Returns:       spare bytes on success, or -(bytes required) on overflow
+ ******************************************************************/
+int32_t path_write_result(bufferdata_t *buf);
+
+#endif

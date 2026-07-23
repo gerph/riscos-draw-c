@@ -1,0 +1,60 @@
+/*******************************************************************
+ * File:     thicken_internal
+ * Purpose:  Gapped-path thickening engine shared between c.thicken and
+ *           c.cap only - not part of the public API in h.thicken
+ * Author:   Gerph
+ * Date:     23 Jul 2026
+ ******************************************************************/
+
+#ifndef THICKEN_INTERNAL_H
+#define THICKEN_INTERNAL_H
+
+#include "types.h"
+#include "bufferdata.h"
+#include "pathio.h"
+
+/* A path being thickened may already have gaps in it (from dash()): a
+ * GapTo, or a closing edge of CloseGap. Unlike Subpath (see h.pathio),
+ * GappedPath keeps every vertex - including the ones either side of a gap
+ * - along with a flag for whether the edge leading into it is a gap
+ * (unstroked) or a real line.
+ */
+typedef struct {
+    OS_Coord pts[PATH_MAX_POINTS];
+    uint8_t  gap_before[PATH_MAX_POINTS]; /* gap_before[i]: edge pts[i-1]->pts[i] is unstroked; [0] unused */
+    int32_t  count;
+} GappedPath;
+
+/*************************************************** Gerph *********
+ Function:      thicken_read_gapped_subpath
+ Description:   Read one subpath starting at inpath (a MoveTo or
+                SpecialMoveTo), which may contain GapTo elements and be
+                closed with CloseGap as well as CloseLine. A CloseLine
+                appends the start point back on as a real edge; a CloseGap
+                appends it as a gap edge (ie it is never stroked), matching
+                the fact that "close with a gap" draws no line for that
+                edge.
+ Parameters:    inpath-> the MoveTo/SpecialMoveTo starting the subpath
+                gp-> the GappedPath to fill in
+ Returns:       pointer to the element following the subpath
+ ******************************************************************/
+Draw_PathElement *thicken_read_gapped_subpath(Draw_PathElement *inpath, GappedPath *gp);
+
+/*************************************************** Gerph *********
+ Function:      thicken_process_gapped
+ Description:   Thicken one already-parsed subpath, which may contain gaps.
+                A single run that loops back to its own start point with no
+                gaps anywhere is a proper closed ring (mitred/bevelled all
+                the way round); anything else is broken at each gap into
+                independent, individually-capped open runs.
+ Parameters:    gp-> the subpath to thicken
+                half_thick = half the line thickness
+                style-> cap style to apply to open run ends, or NULL for a
+                        plain butt line (see cap_emit())
+                buf-> the path writer
+ Returns:       none
+ ******************************************************************/
+void thicken_process_gapped(GappedPath *gp, double half_thick,
+                             Draw_LineStyle *style, bufferdata_t *buf);
+
+#endif

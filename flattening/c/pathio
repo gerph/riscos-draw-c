@@ -1,0 +1,133 @@
+/*******************************************************************
+ * File:        pathio
+ * Purpose:     Reading and writing raw Draw_PathElement streams, shared by
+ *              the flattening, dashing, thickening and capping stages
+ * Author:      Gerph
+ ******************************************************************/
+
+#include "pathio.h"
+
+Draw_PathElement *advance_element(Draw_PathElement *e)
+{
+    switch (e->tag)
+    {
+        case Draw_MoveTo:
+        case Draw_SpecialMoveTo:
+        case Draw_LineTo:
+        case Draw_GapTo:
+            return (Draw_PathElement *)(((int32_t *)e) + 3);
+
+        case Draw_BezierTo:
+            return (Draw_PathElement *)(((int32_t *)e) + 7);
+
+        case Draw_CloseGap:
+        case Draw_CloseLine:
+            return (Draw_PathElement *)(((int32_t *)e) + 1);
+
+        case Draw_Continuation:
+            return (Draw_PathElement *)(((int32_t *)e) + 2);
+
+        case Draw_EndPath:
+        default:
+            return (Draw_PathElement *)(((int32_t *)e) + 2);
+    }
+}
+
+void subpath_add_point(Subpath *sp, int32_t x, int32_t y)
+{
+    if (sp->count > 0 &&
+        sp->pts[sp->count - 1].x == x && sp->pts[sp->count - 1].y == y)
+        return;
+
+    if (sp->count < PATH_MAX_POINTS)
+    {
+        sp->pts[sp->count].x = x;
+        sp->pts[sp->count].y = y;
+        sp->count++;
+    }
+}
+
+Draw_PathElement *path_read_subpath(Draw_PathElement *inpath, Subpath *sp)
+{
+    sp->count = 0;
+    sp->close_tag = 0;
+
+    subpath_add_point(sp, inpath->data.move_to.x, inpath->data.move_to.y);
+    inpath = advance_element(inpath);
+
+    while (inpath->tag == Draw_LineTo)
+    {
+        subpath_add_point(sp, inpath->data.line_to.x, inpath->data.line_to.y);
+        inpath = advance_element(inpath);
+    }
+
+    if (inpath->tag == Draw_CloseGap || inpath->tag == Draw_CloseLine)
+    {
+        sp->close_tag = inpath->tag;
+        inpath = advance_element(inpath);
+
+        /* An explicit line back to the start point is redundant once closed */
+        if (sp->count > 1 &&
+            sp->pts[0].x == sp->pts[sp->count - 1].x &&
+            sp->pts[0].y == sp->pts[sp->count - 1].y)
+        {
+            sp->count--;
+        }
+    }
+
+    return inpath;
+}
+
+void path_writer_init(bufferdata_t *buf, Draw_PathElement *outpath)
+{
+    uint32_t capacity = (uint32_t)(sizeof(int32_t) * 2) + (uint32_t)outpath->data.end_path;
+    bufferdata_init(buf, (uint8_t *)outpath, capacity);
+}
+
+static void path_write_tag(bufferdata_t *buf, Draw_Tag tag)
+{
+    bufferdata_write_word(buf, (uint32_t)tag);
+}
+
+void path_write_moveto(bufferdata_t *buf, OS_Coord p)
+{
+    path_write_tag(buf, Draw_MoveTo);
+    bufferdata_write_word(buf, (uint32_t)p.x);
+    bufferdata_write_word(buf, (uint32_t)p.y);
+    bufferdata_complete(buf);
+}
+
+void path_write_lineto(bufferdata_t *buf, OS_Coord p)
+{
+    path_write_tag(buf, Draw_LineTo);
+    bufferdata_write_word(buf, (uint32_t)p.x);
+    bufferdata_write_word(buf, (uint32_t)p.y);
+    bufferdata_complete(buf);
+}
+
+void path_write_gapto(bufferdata_t *buf, OS_Coord p)
+{
+    path_write_tag(buf, Draw_GapTo);
+    bufferdata_write_word(buf, (uint32_t)p.x);
+    bufferdata_write_word(buf, (uint32_t)p.y);
+    bufferdata_complete(buf);
+}
+
+void path_write_close(bufferdata_t *buf, Draw_Tag which)
+{
+    path_write_tag(buf, which);
+    bufferdata_complete(buf);
+}
+
+void path_write_endpath(bufferdata_t *buf)
+{
+    path_write_tag(buf, Draw_EndPath);
+    bufferdata_write_word(buf, bufferdata_failed(buf) ? 0 : bufferdata_remaining(buf));
+}
+
+int32_t path_write_result(bufferdata_t *buf)
+{
+    if (bufferdata_failed(buf))
+        return -(int32_t)bufferdata_required(buf);
+    return (int32_t)bufferdata_remaining(buf);
+}

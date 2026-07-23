@@ -1,0 +1,36 @@
+/*******************************************************************
+ * File:     cap
+ * Purpose:  Finishing a thickened line's open ends with a Draw line-cap
+ *           style (butt, round, projecting square or triangular)
+ * Author:   Gerph
+ * Date:     23 Jul 2026
+ ******************************************************************/
+
+#ifndef CAP_H
+#define CAP_H
+
+#include "types.h"
+
+/*************************************************** Gerph *********
+ Function:      cap
+ Description:   Thicken a flattened (and optionally dashed) Draw path
+                exactly as thicken() does, except that the ends of open
+                runs are finished with the cap style described by 'style'
+                (matching Draw_Stroke's own cap and join block) instead of
+                a plain butt line
+ Parameters:    inpath-> source path (read-only), already flattened (and
+                         optionally dashed)
+                outpath-> output buffer, initially holding a single EndPath
+                          whose end_path field contains the number of bytes
+                          available after it
+                thickness = overall width of the thickened band
+                            (THICKNESS/2 either side of the original line)
+                style-> start/end cap styles (and, for triangular caps,
+                        their width and length) to apply; NULL behaves
+                        exactly like thicken()
+ Returns:       the standard RISC OS space-report - see path_write_result()
+ ******************************************************************/
+int32_t cap(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickness,
+            Draw_LineStyle *style);
+
+#endif

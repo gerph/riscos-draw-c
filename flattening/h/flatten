@@ -1,0 +1,29 @@
+/*******************************************************************
+ * File:     flatten
+ * Purpose:  Converting Bezier curves in a Draw path into line segments
+ * Author:   Gerph
+ * Date:     23 Jul 2026
+ ******************************************************************/
+
+#ifndef FLATTEN_H
+#define FLATTEN_H
+
+#include "types.h"
+
+/*************************************************** Gerph *********
+ Function:      flatten
+ Description:   Flatten a Draw path, converting BezierTo elements into
+                LineTo sequences
+ Parameters:    inpath-> source path (read-only)
+                outpath-> output buffer, initially holding a single EndPath
+                          whose end_path field contains the number of bytes
+                          available after it
+                flatness = maximum permitted deviation of a line from the
+                           true curve
+ Returns:       the standard RISC OS space-report: spare bytes left in
+                outpath on success, or -(bytes that would have been
+                required) if it overflowed - see path_write_result()
+ ******************************************************************/
+int32_t flatten(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t flatness);
+
+#endif

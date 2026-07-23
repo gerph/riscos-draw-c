@@ -1,0 +1,34 @@
+/*******************************************************************
+ * File:     thicken
+ * Purpose:  Converting a flattened (and optionally dashed) Draw path into
+ *           a filled outline path of a given thickness
+ * Author:   Gerph
+ * Date:     23 Jul 2026
+ ******************************************************************/
+
+#ifndef THICKEN_H
+#define THICKEN_H
+
+#include "types.h"
+
+/*************************************************** Gerph *********
+ Function:      thicken
+ Description:   Thicken a flattened Draw path (MoveTo/LineTo/GapTo,
+                optionally closed with CloseGap/CloseLine) into a filled
+                outline path, THICKNESS wide and centred on the original
+                lines. GapTo runs and a CloseGap's closing edge are not
+                stroked, exactly as Draw's own definition of a gap requires
+                - this is what lets a dashed path (see dash()) thicken
+                correctly.
+ Parameters:    inpath-> source path (read-only), already flattened (and
+                         optionally dashed)
+                outpath-> output buffer, initially holding a single EndPath
+                          whose end_path field contains the number of bytes
+                          available after it
+                thickness = overall width of the thickened band
+                            (THICKNESS/2 either side of the original line)
+ Returns:       the standard RISC OS space-report - see path_write_result()
+ ******************************************************************/
+int32_t thicken(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickness);
+
+#endif

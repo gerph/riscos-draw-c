@@ -1,0 +1,119 @@
+/*******************************************************************
+ * File:        flatten
+ * Purpose:     Converting Bezier curves in a Draw path into line segments
+ * Author:      Gerph
+ ******************************************************************/
+
+#include "flatten.h"
+#include "pathio.h"
+
+static int32_t iabs32(int32_t x)
+{
+    return x < 0 ? -x : x;
+}
+
+/* Recursively flatten a cubic Bezier segment using De Casteljau subdivision.
+ * P0 (x0,y0) is the current pen position; P1, P2 are control points; P3 is
+ * the endpoint. Writes LineTo elements to buf.
+ */
+static void flatten_bezier(
+    int32_t x0, int32_t y0,
+    int32_t x1, int32_t y1,
+    int32_t x2, int32_t y2,
+    int32_t x3, int32_t y3,
+    bufferdata_t *buf,
+    int32_t flatness)
+{
+    int32_t ux = 2*x1 - x0 - x2;
+    int32_t uy = 2*y1 - y0 - y2;
+    int32_t vx = 2*x2 - x1 - x3;
+    int32_t vy = 2*y2 - y1 - y3;
+    int32_t d  = iabs32(ux) + iabs32(uy) + iabs32(vx) + iabs32(vy);
+
+    if (d <= 4 * flatness)
+    {
+        /* Flat enough: emit a LineTo to the endpoint */
+        OS_Coord p;
+        p.x = x3;
+        p.y = y3;
+        path_write_lineto(buf, p);
+    }
+    else
+    {
+        /* Subdivide at t=0.5 using De Casteljau's algorithm */
+        int32_t x01   = (x0  + x1)  / 2;
+        int32_t y01   = (y0  + y1)  / 2;
+        int32_t x12   = (x1  + x2)  / 2;
+        int32_t y12   = (y1  + y2)  / 2;
+        int32_t x23   = (x2  + x3)  / 2;
+        int32_t y23   = (y2  + y3)  / 2;
+        int32_t x012  = (x01 + x12) / 2;
+        int32_t y012  = (y01 + y12) / 2;
+        int32_t x123  = (x12 + x23) / 2;
+        int32_t y123  = (y12 + y23) / 2;
+        int32_t x0123 = (x012 + x123) / 2;
+        int32_t y0123 = (y012 + y123) / 2;
+
+        flatten_bezier(x0,    y0,    x01,  y01,  x012,  y012,  x0123, y0123,
+                       buf, flatness);
+        flatten_bezier(x0123, y0123, x123, y123, x23,   y23,   x3,    y3,
+                       buf, flatness);
+    }
+}
+
+int32_t flatten(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t flatness)
+{
+    bufferdata_t buf;
+    int32_t cur_x = 0;
+    int32_t cur_y = 0;
+
+    path_writer_init(&buf, outpath);
+
+    while (inpath->tag != Draw_EndPath)
+    {
+        switch (inpath->tag)
+        {
+            case Draw_MoveTo:
+                path_write_moveto(&buf, inpath->data.move_to);
+                cur_x = inpath->data.move_to.x;
+                cur_y = inpath->data.move_to.y;
+                inpath = (Draw_PathElement *)(((int32_t *)inpath) + 3);
+                break;
+
+            case Draw_LineTo:
+                path_write_lineto(&buf, inpath->data.line_to);
+                cur_x = inpath->data.line_to.x;
+                cur_y = inpath->data.line_to.y;
+                inpath = (Draw_PathElement *)(((int32_t *)inpath) + 3);
+                break;
+
+            case Draw_BezierTo:
+            {
+                int32_t x1 = inpath->data.bezier_to[0].x;
+                int32_t y1 = inpath->data.bezier_to[0].y;
+                int32_t x2 = inpath->data.bezier_to[1].x;
+                int32_t y2 = inpath->data.bezier_to[1].y;
+                int32_t x3 = inpath->data.bezier_to[2].x;
+                int32_t y3 = inpath->data.bezier_to[2].y;
+                flatten_bezier(cur_x, cur_y, x1, y1, x2, y2, x3, y3, &buf, flatness);
+                cur_x = x3;
+                cur_y = y3;
+                inpath = (Draw_PathElement *)(((int32_t *)inpath) + 7);
+                break;
+            }
+
+            case Draw_CloseGap:
+            case Draw_CloseLine:
+                path_write_close(&buf, inpath->tag);
+                inpath = advance_element(inpath);
+                break;
+
+            default:
+                inpath = advance_element(inpath);
+                break;
+        }
+    }
+
+    path_write_endpath(&buf);
+    return path_write_result(&buf);
+}

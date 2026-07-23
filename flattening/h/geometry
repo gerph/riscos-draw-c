@@ -1,0 +1,60 @@
+/*******************************************************************
+ * File:     geometry
+ * Purpose:  Small 2D vector helpers shared by the thickening, capping and
+ *           dashing stages
+ * Author:   Gerph
+ * Date:     23 Jul 2026
+ ******************************************************************/
+
+#ifndef GEOMETRY_H
+#define GEOMETRY_H
+
+#include "types.h"
+
+typedef struct {
+    double x, y;
+} Vec2;
+
+/*************************************************** Gerph *********
+ Function:      coord_to_vec
+ Description:   Convert an integer Draw coordinate to a Vec2
+ Parameters:    p = the coordinate to convert
+ Returns:       the equivalent Vec2
+ ******************************************************************/
+Vec2 coord_to_vec(OS_Coord p);
+
+/*************************************************** Gerph *********
+ Function:      vec_to_coord
+ Description:   Convert a Vec2 back to an integer Draw coordinate, rounding
+                to the nearest whole unit
+ Parameters:    v = the vector to convert
+ Returns:       the equivalent OS_Coord
+ ******************************************************************/
+OS_Coord vec_to_coord(Vec2 v);
+
+/*************************************************** Gerph *********
+ Function:      unit_dir
+ Description:   Calculate the unit direction vector from a to b. Zero-length
+                segments (a degenerate, duplicated point) are given an
+                arbitrary direction rather than dividing by zero; callers
+                tolerate this since such segments contribute nothing visible.
+ Parameters:    a = the point the segment starts at
+                b = the point the segment ends at
+ Returns:       unit vector pointing from a to b
+ ******************************************************************/
+Vec2 unit_dir(OS_Coord a, OS_Coord b);
+
+/*************************************************** Gerph *********
+ Function:      offset_point
+ Description:   Calculate the point offset from V by half_thick,
+                perpendicular to unit direction dir
+ Parameters:    V = the point to offset from
+                dir = unit direction the line is travelling in at V
+                side_sign = +1.0 to offset to the left of dir, -1.0 to the
+                            right
+                half_thick = distance to offset by
+ Returns:       the offset point
+ ******************************************************************/
+Vec2 offset_point(Vec2 V, Vec2 dir, double side_sign, double half_thick);
+
+#endif
