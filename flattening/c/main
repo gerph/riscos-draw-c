@@ -16,8 +16,8 @@
 
 #include "types.h"
 
-int32_t in_buffer[256];
-int32_t out_buffer[256];
+int32_t in_buffer[1024];
+int32_t out_buffer[1024];
 
 #define FLATTENING (16)
 #define THICKNESS  (4)
@@ -1331,10 +1331,13 @@ void test_capping(void)
         style.end_cap_style = styles[i];
         style.reserved = 0;
         style.mitre_limit = 0;
-        style.start_cap_width = 128;   /* 0.5 linewidth: flush with the stroke edge */
-        style.start_cap_length = 192;  /* 0.75 linewidth */
-        style.end_cap_width = 128;
-        style.end_cap_length = 192;
+        /* Wider than the line itself (>0.5 linewidth), so the triangular
+         * cap flares out into a proper arrowhead rather than just tapering
+         * the existing edges to a point. Ignored by the other styles. */
+        style.start_cap_width = 384;   /* 1.5 linewidth */
+        style.start_cap_length = 320;  /* 1.25 linewidth */
+        style.end_cap_width = 384;
+        style.end_cap_length = 320;
 
         cap(inpath, outpath, cap_thickness, &style);
 
