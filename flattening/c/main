@@ -15,6 +15,7 @@
 #include "VersionNum"
 
 #include "types.h"
+#include "bufferdata.h"
 
 int32_t in_buffer[1024];
 int32_t out_buffer[1024];
@@ -136,18 +137,102 @@ static Draw_PathElement *advance_element(Draw_PathElement *e)
     }
 }
 
+
+/* ------------------------------------------------------------------------
+ * Output path writing
+ *
+ * All of flatten()/dash()/thicken()/cap() write their output path through
+ * a bufferdata_t (see h.bufferdata) rather than hand-rolled pointer
+ * arithmetic and a decrementing byte count. bufferdata never writes past
+ * the buffer it was given, but keeps counting how much space *would* have
+ * been needed, so a caller can distinguish "ran out of space" from
+ * "finished successfully" and find out exactly how much more space is
+ * needed - the same information a real Draw module SWI reports back to its
+ * caller (eg via R2) when asked to size a buffer.
+ * ------------------------------------------------------------------------
+ */
+
+/* outpath must already hold a single EndPath element whose end_path field
+ * gives the number of bytes available after it - the standard Draw module
+ * output-path convention - so the writer's usable capacity is those bytes
+ * plus the two words the placeholder itself occupies (which get
+ * overwritten by whatever is written first).
+ */
+static void path_writer_init(bufferdata_t *buf, Draw_PathElement *outpath)
+{
+    uint32_t capacity = (uint32_t)(sizeof(int32_t) * 2) + (uint32_t)outpath->data.end_path;
+    bufferdata_init(buf, (uint8_t *)outpath, capacity);
+}
+
+static void path_write_tag(bufferdata_t *buf, Draw_Tag tag)
+{
+    bufferdata_write_word(buf, (uint32_t)tag);
+}
+
+static void path_write_moveto(bufferdata_t *buf, OS_Coord p)
+{
+    path_write_tag(buf, Draw_MoveTo);
+    bufferdata_write_word(buf, (uint32_t)p.x);
+    bufferdata_write_word(buf, (uint32_t)p.y);
+    bufferdata_complete(buf);
+}
+
+static void path_write_lineto(bufferdata_t *buf, OS_Coord p)
+{
+    path_write_tag(buf, Draw_LineTo);
+    bufferdata_write_word(buf, (uint32_t)p.x);
+    bufferdata_write_word(buf, (uint32_t)p.y);
+    bufferdata_complete(buf);
+}
+
+static void path_write_gapto(bufferdata_t *buf, OS_Coord p)
+{
+    path_write_tag(buf, Draw_GapTo);
+    bufferdata_write_word(buf, (uint32_t)p.x);
+    bufferdata_write_word(buf, (uint32_t)p.y);
+    bufferdata_complete(buf);
+}
+
+/* which must be Draw_CloseLine or Draw_CloseGap */
+static void path_write_close(bufferdata_t *buf, Draw_Tag which)
+{
+    path_write_tag(buf, which);
+    bufferdata_complete(buf);
+}
+
+/* The terminating EndPath is metadata about the buffer, not a path element
+ * in its own right, so - unlike the writers above - this does not mark a
+ * bufferdata "record" complete. Always safe to call even after a failure:
+ * bufferdata_write_word never writes past the buffer it was given.
+ */
+static void path_write_endpath(bufferdata_t *buf)
+{
+    path_write_tag(buf, Draw_EndPath);
+    bufferdata_write_word(buf, bufferdata_failed(buf) ? 0 : bufferdata_remaining(buf));
+}
+
+/* The standard RISC OS convention this project is following (see
+ * h.bufferdata's own usage example): a positive result is the spare space
+ * left in the buffer; a negative result is -(the space that would have
+ * been required to succeed).
+ */
+static int32_t path_write_result(bufferdata_t *buf)
+{
+    if (bufferdata_failed(buf))
+        return -(int32_t)bufferdata_required(buf);
+    return (int32_t)bufferdata_remaining(buf);
+}
+
 /* Recursively flatten a cubic Bezier segment using De Casteljau subdivision.
  * P0 (x0,y0) is the current pen position; P1, P2 are control points; P3 is
- * the endpoint. Emits LineTo elements into out, updating *space_remaining.
- * Returns the updated out pointer.
+ * the endpoint. Writes LineTo elements to buf.
  */
-static Draw_PathElement *flatten_bezier(
+static void flatten_bezier(
     int32_t x0, int32_t y0,
     int32_t x1, int32_t y1,
     int32_t x2, int32_t y2,
     int32_t x3, int32_t y3,
-    Draw_PathElement *out,
-    int32_t *space_remaining,
+    bufferdata_t *buf,
     int32_t flatness)
 {
     int32_t ux = 2*x1 - x0 - x2;
@@ -159,14 +244,10 @@ static Draw_PathElement *flatten_bezier(
     if (d <= 4 * flatness)
     {
         /* Flat enough: emit a LineTo to the endpoint */
-        if (*space_remaining >= (int32_t)(sizeof(int32_t) * 3))
-        {
-            out->tag = Draw_LineTo;
-            out->data.line_to.x = x3;
-            out->data.line_to.y = y3;
-            out = (Draw_PathElement *)(((int32_t *)out) + 3);
-            *space_remaining -= (int32_t)(sizeof(int32_t) * 3);
-        }
+        OS_Coord p;
+        p.x = x3;
+        p.y = y3;
+        path_write_lineto(buf, p);
     }
     else
     {
@@ -184,13 +265,11 @@ static Draw_PathElement *flatten_bezier(
         int32_t x0123 = (x012 + x123) / 2;
         int32_t y0123 = (y012 + y123) / 2;
 
-        out = flatten_bezier(x0,    y0,    x01,  y01,  x012,  y012,  x0123, y0123,
-                             out, space_remaining, flatness);
-        out = flatten_bezier(x0123, y0123, x123, y123, x23,   y23,   x3,    y3,
-                             out, space_remaining, flatness);
+        flatten_bezier(x0,    y0,    x01,  y01,  x012,  y012,  x0123, y0123,
+                       buf, flatness);
+        flatten_bezier(x0123, y0123, x123, y123, x23,   y23,   x3,    y3,
+                       buf, flatness);
     }
-
-    return out;
 }
 
 
@@ -199,41 +278,31 @@ static Draw_PathElement *flatten_bezier(
  * outpath:  output buffer, initially holding a single EndPath whose end_path
  *           field contains the number of bytes available after it
  * flatness: maximum permitted deviation of a line from the true curve
+ * Returns the standard RISC OS space-report: spare bytes left in outpath on
+ * success, or -(bytes that would have been required) if it overflowed - see
+ * the "Output path writing" section above.
  */
-void flatten(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t flatness)
+int32_t flatten(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t flatness)
 {
-    Draw_PathElement *out = outpath;
-    int32_t space_remaining = outpath->data.end_path;
+    bufferdata_t buf;
     int32_t cur_x = 0;
     int32_t cur_y = 0;
+
+    path_writer_init(&buf, outpath);
 
     while (inpath->tag != Draw_EndPath)
     {
         switch (inpath->tag)
         {
             case Draw_MoveTo:
-                if (space_remaining >= (int32_t)(sizeof(int32_t) * 3))
-                {
-                    out->tag = Draw_MoveTo;
-                    out->data.move_to.x = inpath->data.move_to.x;
-                    out->data.move_to.y = inpath->data.move_to.y;
-                    out = (Draw_PathElement *)(((int32_t *)out) + 3);
-                    space_remaining -= (int32_t)(sizeof(int32_t) * 3);
-                }
+                path_write_moveto(&buf, inpath->data.move_to);
                 cur_x = inpath->data.move_to.x;
                 cur_y = inpath->data.move_to.y;
                 inpath = (Draw_PathElement *)(((int32_t *)inpath) + 3);
                 break;
 
             case Draw_LineTo:
-                if (space_remaining >= (int32_t)(sizeof(int32_t) * 3))
-                {
-                    out->tag = Draw_LineTo;
-                    out->data.line_to.x = inpath->data.line_to.x;
-                    out->data.line_to.y = inpath->data.line_to.y;
-                    out = (Draw_PathElement *)(((int32_t *)out) + 3);
-                    space_remaining -= (int32_t)(sizeof(int32_t) * 3);
-                }
+                path_write_lineto(&buf, inpath->data.line_to);
                 cur_x = inpath->data.line_to.x;
                 cur_y = inpath->data.line_to.y;
                 inpath = (Draw_PathElement *)(((int32_t *)inpath) + 3);
@@ -247,8 +316,7 @@ void flatten(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t flatne
                 int32_t y2 = inpath->data.bezier_to[1].y;
                 int32_t x3 = inpath->data.bezier_to[2].x;
                 int32_t y3 = inpath->data.bezier_to[2].y;
-                out = flatten_bezier(cur_x, cur_y, x1, y1, x2, y2, x3, y3,
-                                     out, &space_remaining, flatness);
+                flatten_bezier(cur_x, cur_y, x1, y1, x2, y2, x3, y3, &buf, flatness);
                 cur_x = x3;
                 cur_y = y3;
                 inpath = (Draw_PathElement *)(((int32_t *)inpath) + 7);
@@ -257,12 +325,7 @@ void flatten(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t flatne
 
             case Draw_CloseGap:
             case Draw_CloseLine:
-                if (space_remaining >= (int32_t)(sizeof(int32_t) * 1))
-                {
-                    out->tag = inpath->tag;
-                    out = (Draw_PathElement *)(((int32_t *)out) + 1);
-                    space_remaining -= (int32_t)(sizeof(int32_t) * 1);
-                }
+                path_write_close(&buf, inpath->tag);
                 inpath = advance_element(inpath);
                 break;
 
@@ -272,9 +335,8 @@ void flatten(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t flatne
         }
     }
 
-    /* Write the closing EndPath element */
-    out->tag = Draw_EndPath;
-    out->data.end_path = space_remaining - (int32_t)(sizeof(int32_t) * 2);
+    path_write_endpath(&buf);
+    return path_write_result(&buf);
 }
 
 
@@ -545,60 +607,10 @@ static int32_t side_offset_closed(Subpath *sp, double side_sign, double half_thi
     return m;
 }
 
-static Draw_PathElement *emit_move(Draw_PathElement *out, int32_t *space_remaining, OS_Coord p)
-{
-    if (*space_remaining >= (int32_t)(sizeof(int32_t) * 3))
-    {
-        out->tag = Draw_MoveTo;
-        out->data.move_to.x = p.x;
-        out->data.move_to.y = p.y;
-        out = (Draw_PathElement *)(((int32_t *)out) + 3);
-        *space_remaining -= (int32_t)(sizeof(int32_t) * 3);
-    }
-    return out;
-}
-
-static Draw_PathElement *emit_line(Draw_PathElement *out, int32_t *space_remaining, OS_Coord p)
-{
-    if (*space_remaining >= (int32_t)(sizeof(int32_t) * 3))
-    {
-        out->tag = Draw_LineTo;
-        out->data.line_to.x = p.x;
-        out->data.line_to.y = p.y;
-        out = (Draw_PathElement *)(((int32_t *)out) + 3);
-        *space_remaining -= (int32_t)(sizeof(int32_t) * 3);
-    }
-    return out;
-}
-
-static Draw_PathElement *emit_gap(Draw_PathElement *out, int32_t *space_remaining, OS_Coord p)
-{
-    if (*space_remaining >= (int32_t)(sizeof(int32_t) * 3))
-    {
-        out->tag = Draw_GapTo;
-        out->data.gap_to.x = p.x;
-        out->data.gap_to.y = p.y;
-        out = (Draw_PathElement *)(((int32_t *)out) + 3);
-        *space_remaining -= (int32_t)(sizeof(int32_t) * 3);
-    }
-    return out;
-}
-
-static Draw_PathElement *emit_close(Draw_PathElement *out, int32_t *space_remaining)
-{
-    if (*space_remaining >= (int32_t)(sizeof(int32_t) * 1))
-    {
-        out->tag = Draw_CloseLine;
-        out = (Draw_PathElement *)(((int32_t *)out) + 1);
-        *space_remaining -= (int32_t)(sizeof(int32_t) * 1);
-    }
-    return out;
-}
-
-/* Emit the geometry for one line cap. 'from' has already been emitted by
- * the caller; this always finishes by emitting 'to' itself, so the pen ends
- * up exactly there regardless of style - callers don't need to special-case
- * the butt style.
+/* Emit the geometry for one line cap. 'from' has already been written by
+ * the caller; this always finishes by writing 'to' itself, so the writer's
+ * position ends up exactly there regardless of style - callers don't need
+ * to special-case the butt style.
  *
  * P is the path endpoint the cap surrounds; perp is the unit normal with
  * from == P + half_thick*perp (so to == P - half_thick*perp); dir is the
@@ -607,10 +619,10 @@ static Draw_PathElement *emit_close(Draw_PathElement *out, int32_t *space_remain
  * cap). width/length are Draw_LineStyle's triangular cap settings, in
  * 256ths of the line width (THICKNESS, ie 2*half_thick).
  */
-static Draw_PathElement *cap_emit(Draw_PathElement *out, int32_t *space_remaining,
-                                   Vec2 from, Vec2 to, Vec2 P, Vec2 perp, Vec2 dir,
-                                   double half_thick, Draw_CapStyle style,
-                                   int32_t width_256, int32_t length_256)
+static void cap_emit(bufferdata_t *buf,
+                      Vec2 from, Vec2 to, Vec2 P, Vec2 perp, Vec2 dir,
+                      double half_thick, Draw_CapStyle style,
+                      int32_t width_256, int32_t length_256)
 {
     double line_width = half_thick * 2.0;
 
@@ -629,7 +641,7 @@ static Draw_PathElement *cap_emit(Draw_PathElement *out, int32_t *space_remainin
                 Vec2 p;
                 p.x = P.x + half_thick * (perp.x * cos(t) + dir.x * sin(t));
                 p.y = P.y + half_thick * (perp.y * cos(t) + dir.y * sin(t));
-                out = emit_line(out, space_remaining, vec_to_coord(p));
+                path_write_lineto(buf, vec_to_coord(p));
             }
             break;
         }
@@ -644,8 +656,8 @@ static Draw_PathElement *cap_emit(Draw_PathElement *out, int32_t *space_remainin
             p1.y = from.y + dir.y * half_thick;
             p2.x = to.x   + dir.x * half_thick;
             p2.y = to.y   + dir.y * half_thick;
-            out = emit_line(out, space_remaining, vec_to_coord(p1));
-            out = emit_line(out, space_remaining, vec_to_coord(p2));
+            path_write_lineto(buf, vec_to_coord(p1));
+            path_write_lineto(buf, vec_to_coord(p2));
             break;
         }
 
@@ -663,9 +675,9 @@ static Draw_PathElement *cap_emit(Draw_PathElement *out, int32_t *space_remainin
             apex.y  = P.y + dir.y * l;
             base2.x = P.x - perp.x * w;
             base2.y = P.y - perp.y * w;
-            out = emit_line(out, space_remaining, vec_to_coord(base1));
-            out = emit_line(out, space_remaining, vec_to_coord(apex));
-            out = emit_line(out, space_remaining, vec_to_coord(base2));
+            path_write_lineto(buf, vec_to_coord(base1));
+            path_write_lineto(buf, vec_to_coord(apex));
+            path_write_lineto(buf, vec_to_coord(base2));
             break;
         }
 
@@ -674,7 +686,7 @@ static Draw_PathElement *cap_emit(Draw_PathElement *out, int32_t *space_remainin
             break;
     }
 
-    return emit_line(out, space_remaining, vec_to_coord(to));
+    path_write_lineto(buf, vec_to_coord(to));
 }
 
 /* Emit an open subpath as a single closed loop: out along the left offset,
@@ -684,9 +696,8 @@ static Draw_PathElement *cap_emit(Draw_PathElement *out, int32_t *space_remainin
  * style is NULL, which is what thicken() below always passes; cap() passes
  * a real style to get round/square/triangular caps instead.
  */
-static Draw_PathElement *thicken_emit_open(Subpath *sp, double half_thick,
-                                            Draw_LineStyle *style,
-                                            Draw_PathElement *out, int32_t *space_remaining)
+static void thicken_emit_open(Subpath *sp, double half_thick,
+                               Draw_LineStyle *style, bufferdata_t *buf)
 {
     Vec2 left[2 * PATH_MAX_POINTS];
     Vec2 right[2 * PATH_MAX_POINTS];
@@ -695,11 +706,11 @@ static Draw_PathElement *thicken_emit_open(Subpath *sp, double half_thick,
     int32_t i;
 
     if (nl < 1 || nr < 1)
-        return out;
+        return;
 
-    out = emit_move(out, space_remaining, vec_to_coord(left[0]));
+    path_write_moveto(buf, vec_to_coord(left[0]));
     for (i = 1; i < nl; i++)
-        out = emit_line(out, space_remaining, vec_to_coord(left[i]));
+        path_write_lineto(buf, vec_to_coord(left[i]));
 
     if (style != NULL)
     {
@@ -710,15 +721,15 @@ static Draw_PathElement *thicken_emit_open(Subpath *sp, double half_thick,
         Vec2 perp;
         perp.x = -dir.y;
         perp.y = dir.x;
-        out = cap_emit(out, space_remaining, left[nl - 1], right[nr - 1], P, perp, dir,
-                        half_thick, style->end_cap_style,
-                        style->end_cap_width, style->end_cap_length);
+        cap_emit(buf, left[nl - 1], right[nr - 1], P, perp, dir,
+                 half_thick, style->end_cap_style,
+                 style->end_cap_width, style->end_cap_length);
     }
     else
-        out = emit_line(out, space_remaining, vec_to_coord(right[nr - 1]));
+        path_write_lineto(buf, vec_to_coord(right[nr - 1]));
 
     for (i = nr - 2; i >= 0; i--)
-        out = emit_line(out, space_remaining, vec_to_coord(right[i]));
+        path_write_lineto(buf, vec_to_coord(right[i]));
 
     if (style != NULL)
     {
@@ -731,21 +742,18 @@ static Draw_PathElement *thicken_emit_open(Subpath *sp, double half_thick,
         perp.y = -dir.x;
         out_dir.x = -dir.x;
         out_dir.y = -dir.y;
-        out = cap_emit(out, space_remaining, right[0], left[0], P, perp, out_dir,
-                        half_thick, style->start_cap_style,
-                        style->start_cap_width, style->start_cap_length);
+        cap_emit(buf, right[0], left[0], P, perp, out_dir,
+                 half_thick, style->start_cap_style,
+                 style->start_cap_width, style->start_cap_length);
     }
 
-    out = emit_close(out, space_remaining);
-
-    return out;
+    path_write_close(buf, Draw_CloseLine);
 }
 
 /* Emit a closed subpath as two closed rings, wound in opposite directions
  * so a nonzero winding rule fills the band between them.
  */
-static Draw_PathElement *thicken_emit_closed(Subpath *sp, double half_thick,
-                                              Draw_PathElement *out, int32_t *space_remaining)
+static void thicken_emit_closed(Subpath *sp, double half_thick, bufferdata_t *buf)
 {
     Vec2 left[2 * PATH_MAX_POINTS];
     Vec2 right[2 * PATH_MAX_POINTS];
@@ -755,21 +763,19 @@ static Draw_PathElement *thicken_emit_closed(Subpath *sp, double half_thick,
 
     if (nl >= 3)
     {
-        out = emit_move(out, space_remaining, vec_to_coord(left[0]));
+        path_write_moveto(buf, vec_to_coord(left[0]));
         for (i = 1; i < nl; i++)
-            out = emit_line(out, space_remaining, vec_to_coord(left[i]));
-        out = emit_close(out, space_remaining);
+            path_write_lineto(buf, vec_to_coord(left[i]));
+        path_write_close(buf, Draw_CloseLine);
     }
 
     if (nr >= 3)
     {
-        out = emit_move(out, space_remaining, vec_to_coord(right[nr - 1]));
+        path_write_moveto(buf, vec_to_coord(right[nr - 1]));
         for (i = nr - 2; i >= 0; i--)
-            out = emit_line(out, space_remaining, vec_to_coord(right[i]));
-        out = emit_close(out, space_remaining);
+            path_write_lineto(buf, vec_to_coord(right[i]));
+        path_write_close(buf, Draw_CloseLine);
     }
-
-    return out;
 }
 
 /* A path being thickened may already have gaps in it (from dash()): a
@@ -835,15 +841,14 @@ static Draw_PathElement *thicken_read_gapped_subpath(Draw_PathElement *inpath, G
  * closed ring (mitred/bevelled all the way round); anything else is broken
  * at each gap into independent, individually-capped open runs.
  */
-static Draw_PathElement *thicken_process_gapped(GappedPath *gp, double half_thick,
-                                                 Draw_LineStyle *style,
-                                                 Draw_PathElement *out, int32_t *space_remaining)
+static void thicken_process_gapped(GappedPath *gp, double half_thick,
+                                    Draw_LineStyle *style, bufferdata_t *buf)
 {
     int32_t n = gp->count;
     int32_t i;
 
     if (n < 2)
-        return out;
+        return;
 
     if (n >= 3)
     {
@@ -864,7 +869,8 @@ static Draw_PathElement *thicken_process_gapped(GappedPath *gp, double half_thic
             ring.count = n - 1;
             ring.close_tag = Draw_CloseLine;
             memcpy(ring.pts, gp->pts, sizeof(OS_Coord) * ring.count);
-            return thicken_emit_closed(&ring, half_thick, out, space_remaining);
+            thicken_emit_closed(&ring, half_thick, buf);
+            return;
         }
     }
 
@@ -880,14 +886,12 @@ static Draw_PathElement *thicken_process_gapped(GappedPath *gp, double half_thic
                     Subpath run;
                     run.count = run_count;
                     memcpy(run.pts, gp->pts + run_start, sizeof(OS_Coord) * run_count);
-                    out = thicken_emit_open(&run, half_thick, style, out, space_remaining);
+                    thicken_emit_open(&run, half_thick, style, buf);
                 }
                 run_start = i;
             }
         }
     }
-
-    return out;
 }
 
 /* Thicken a flattened Draw path (MoveTo/LineTo/GapTo, optionally closed with
@@ -901,12 +905,14 @@ static Draw_PathElement *thicken_process_gapped(GappedPath *gp, double half_thic
  *            end_path field contains the number of bytes available after it
  * thickness: overall width of the thickened band (THICKNESS/2 either side
  *            of the original line)
+ * Returns the standard RISC OS space-report - see path_write_result().
  */
-void thicken(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickness)
+int32_t thicken(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickness)
 {
-    Draw_PathElement *out = outpath;
-    int32_t space_remaining = outpath->data.end_path;
+    bufferdata_t buf;
     double half_thick = thickness / 2.0;
+
+    path_writer_init(&buf, outpath);
 
     while (inpath->tag != Draw_EndPath)
     {
@@ -922,12 +928,11 @@ void thicken(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickn
         inpath = thicken_read_gapped_subpath(inpath, &gp);
 
         if (half_thick > 0.0)
-            out = thicken_process_gapped(&gp, half_thick, NULL, out, &space_remaining);
+            thicken_process_gapped(&gp, half_thick, NULL, &buf);
     }
 
-    /* Write the closing EndPath element */
-    out->tag = Draw_EndPath;
-    out->data.end_path = space_remaining - (int32_t)(sizeof(int32_t) * 2);
+    path_write_endpath(&buf);
+    return path_write_result(&buf);
 }
 
 
@@ -959,19 +964,18 @@ void thicken(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickn
  *            of the original line)
  * style:     start/end cap styles (and, for triangular caps, their width
  *            and length) to apply; NULL behaves exactly like thicken()
+ * Returns the standard RISC OS space-report - see path_write_result().
  */
-void cap(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickness,
-         Draw_LineStyle *style)
+int32_t cap(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickness,
+            Draw_LineStyle *style)
 {
-    Draw_PathElement *out = outpath;
-    int32_t space_remaining = outpath->data.end_path;
+    bufferdata_t buf;
     double half_thick = thickness / 2.0;
 
     if (style == NULL)
-    {
-        thicken(inpath, outpath, thickness);
-        return;
-    }
+        return thicken(inpath, outpath, thickness);
+
+    path_writer_init(&buf, outpath);
 
     while (inpath->tag != Draw_EndPath)
     {
@@ -986,11 +990,11 @@ void cap(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickness,
         inpath = thicken_read_gapped_subpath(inpath, &gp);
 
         if (half_thick > 0.0)
-            out = thicken_process_gapped(&gp, half_thick, style, out, &space_remaining);
+            thicken_process_gapped(&gp, half_thick, style, &buf);
     }
 
-    out->tag = Draw_EndPath;
-    out->data.end_path = space_remaining - (int32_t)(sizeof(int32_t) * 2);
+    path_write_endpath(&buf);
+    return path_write_result(&buf);
 }
 
 
@@ -1100,11 +1104,10 @@ static void dash_state_init(DashState *ds, Draw_DashPattern *pattern)
 }
 
 /* Walk points[0..n-1] as a single polyline, applying and updating the dash
- * state in ds, emitting LineTo for "on" runs and GapTo for "off" runs.
+ * state in ds, writing LineTo for "on" runs and GapTo for "off" runs.
  * The caller has already written the subpath's initial MoveTo.
  */
-static Draw_PathElement *dash_walk(OS_Coord *points, int32_t n, DashState *ds,
-                                    Draw_PathElement *out, int32_t *space_remaining)
+static void dash_walk(OS_Coord *points, int32_t n, DashState *ds, bufferdata_t *buf)
 {
     int32_t i;
 
@@ -1128,15 +1131,15 @@ static Draw_PathElement *dash_walk(OS_Coord *points, int32_t n, DashState *ds,
             p.x = a.x + (b.x - a.x) * (seg_pos / seg_len);
             p.y = a.y + (b.y - a.y) * (seg_pos / seg_len);
 
-            out = ds->on ? emit_line(out, space_remaining, vec_to_coord(p))
-                         : emit_gap(out, space_remaining, vec_to_coord(p));
+            if (ds->on)
+                path_write_lineto(buf, vec_to_coord(p));
+            else
+                path_write_gapto(buf, vec_to_coord(p));
 
             if (ds->remaining <= 1e-6)
                 dash_state_advance(ds);
         }
     }
-
-    return out;
 }
 
 /* Apply a dash pattern to a flattened path, replacing "off" sections with
@@ -1148,13 +1151,15 @@ static Draw_PathElement *dash_walk(OS_Coord *points, int32_t n, DashState *ds,
  * pattern:  the dash pattern to apply, or NULL for no dashes, in which case
  *           the path is copied through unchanged (matching Draw's own R6=0
  *           convention of "no dashes")
+ * Returns the standard RISC OS space-report - see path_write_result().
  */
-void dash(Draw_PathElement *inpath, Draw_PathElement *outpath, Draw_DashPattern *pattern)
+int32_t dash(Draw_PathElement *inpath, Draw_PathElement *outpath, Draw_DashPattern *pattern)
 {
-    Draw_PathElement *out = outpath;
-    int32_t space_remaining = outpath->data.end_path;
+    bufferdata_t buf;
     DashState ds_template;
     int32_t have_pattern = 0;
+
+    path_writer_init(&buf, outpath);
 
     if (pattern != NULL)
     {
@@ -1181,26 +1186,19 @@ void dash(Draw_PathElement *inpath, Draw_PathElement *outpath, Draw_DashPattern 
         {
             /* No usable pattern, or nothing to dash: copy through unchanged */
             int32_t i;
-            out = emit_move(out, &space_remaining, sp.pts[0]);
+            path_write_moveto(&buf, sp.pts[0]);
             for (i = 1; i < sp.count; i++)
-                out = emit_line(out, &space_remaining, sp.pts[i]);
-            if (sp.close_tag == Draw_CloseLine)
-                out = emit_close(out, &space_remaining);
-            else if (sp.close_tag == Draw_CloseGap &&
-                     space_remaining >= (int32_t)(sizeof(int32_t) * 1))
-            {
-                out->tag = Draw_CloseGap;
-                out = (Draw_PathElement *)(((int32_t *)out) + 1);
-                space_remaining -= (int32_t)(sizeof(int32_t) * 1);
-            }
+                path_write_lineto(&buf, sp.pts[i]);
+            if (sp.close_tag != 0)
+                path_write_close(&buf, sp.close_tag);
             continue;
         }
 
         {
             DashState ds = ds_template;
 
-            out = emit_move(out, &space_remaining, sp.pts[0]);
-            out = dash_walk(sp.pts, sp.count, &ds, out, &space_remaining);
+            path_write_moveto(&buf, sp.pts[0]);
+            dash_walk(sp.pts, sp.count, &ds, &buf);
 
             if (sp.close_tag == Draw_CloseLine)
             {
@@ -1208,7 +1206,7 @@ void dash(Draw_PathElement *inpath, Draw_PathElement *outpath, Draw_DashPattern 
                 OS_Coord seg[2];
                 seg[0] = sp.pts[sp.count - 1];
                 seg[1] = sp.pts[0];
-                out = dash_walk(seg, 2, &ds, out, &space_remaining);
+                dash_walk(seg, 2, &ds, &buf);
             }
             /* A CloseGap's closing edge is never drawn, so it is left out
              * here too, exactly as it is when thickening. Either way, the
@@ -1217,10 +1215,30 @@ void dash(Draw_PathElement *inpath, Draw_PathElement *outpath, Draw_DashPattern 
         }
     }
 
-    out->tag = Draw_EndPath;
-    out->data.end_path = space_remaining - (int32_t)(sizeof(int32_t) * 2);
+    path_write_endpath(&buf);
+    return path_write_result(&buf);
 }
 
+
+/* Reports the standard RISC OS space-report from flatten()/dash()/thicken()/
+ * cap() (see path_write_result()) and says whether the caller can safely go
+ * on to use the output - a negative result means it overflowed and the
+ * output is incomplete, so should not be trusted.
+ */
+static int report_space(const char *stage, int32_t result, uint32_t capacity)
+{
+    if (result < 0)
+    {
+        uint32_t required = (uint32_t)(-result);
+        printf("%s: buffer too small - needs %u bytes, only had %u (%u more needed)\n",
+               stage, (unsigned int)required, (unsigned int)capacity,
+               (unsigned int)(required - capacity));
+        return 0;
+    }
+
+    printf("%s: ok (%d bytes spare)\n", stage, (int)result);
+    return 1;
+}
 
 void test_flattening(void)
 {
@@ -1266,7 +1284,8 @@ void test_flattening(void)
     outpath = (Draw_PathElement *)out_buffer;
     /* The out_buffer now contains a single 'END' which contains the length of the data */
 
-    flatten(inpath, outpath, FLATTENING);
+    if (!report_space("flatten", flatten(inpath, outpath, FLATTENING), sizeof(out_buffer)))
+        return;
 
     /* Reset things so that we can do dashing */
     memcpy(in_buffer, out_buffer, sizeof(out_buffer));
@@ -1281,7 +1300,9 @@ void test_flattening(void)
             int32_t elements[2];
         } test_dash_pattern = { 0, 2, { 1200, 600 } };
 
-        dash(inpath, outpath, (Draw_DashPattern *)&test_dash_pattern);
+        if (!report_space("dash", dash(inpath, outpath, (Draw_DashPattern *)&test_dash_pattern),
+                           sizeof(out_buffer)))
+            return;
     }
 
     /* Reset things so that we can do thickening */
@@ -1290,7 +1311,8 @@ void test_flattening(void)
     ADD_END(outpath, sizeof(out_buffer) - sizeof(int32_t)*2);
     outpath = (Draw_PathElement *)out_buffer;
 
-    thicken(inpath, outpath, THICKNESS);
+    if (!report_space("thicken", thicken(inpath, outpath, THICKNESS), sizeof(out_buffer)))
+        return;
 
     show_path(outpath);
     if (getenv("WAIT") != NULL)
@@ -1339,7 +1361,8 @@ void test_capping(void)
         style.end_cap_width = 384;
         style.end_cap_length = 320;
 
-        cap(inpath, outpath, cap_thickness, &style);
+        if (!report_space(names[i], cap(inpath, outpath, cap_thickness, &style), sizeof(out_buffer)))
+            continue;
 
         printf("--- cap style: %s ---\n", names[i]);
         show_path(outpath);

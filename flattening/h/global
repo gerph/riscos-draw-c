@@ -1,0 +1,11 @@
+/*******************************************************************
+ * File:     global
+ * Purpose:  Project-wide declarations required by shared libraries (eg bufferdata)
+ * Author:   Gerph
+ * Date:     23 Jul 2026
+ ******************************************************************/
+
+#ifndef GLOBAL_H
+#define GLOBAL_H
+
+#endif
