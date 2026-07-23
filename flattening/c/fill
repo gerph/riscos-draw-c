@@ -1,0 +1,289 @@
+/*******************************************************************
+ * File:        fill
+ * Purpose:     Scanline filling of a flattened Draw path, honouring all
+ *              four Draw winding rules
+ * Author:      Gerph
+ ******************************************************************/
+
+#include <stddef.h>
+
+#include "fill.h"
+#include "pathio.h"
+
+/* Maximum edge crossings tracked for a single scanline. A crossing is
+ * produced by every non-horizontal edge (including each subpath's implicit
+ * or explicit closing edge) that the scanline passes through, so this needs
+ * to be comfortably larger than the vertex count of the busiest path we
+ * expect to fill. */
+#define FILL_MAX_CROSSINGS (128)
+
+typedef struct {
+    double  x;
+    int32_t winding;   /* +1 if the edge ran from lower y to higher y, else -1 */
+} Fill_Crossing;
+
+/* Round a double to the nearest int32_t, away from zero on a tie. */
+static int32_t fill_round32(double v)
+{
+    return (int32_t)((v < 0.0) ? (v - 0.5) : (v + 0.5));
+}
+
+/* Decide whether a winding number counts as "inside" under fill_style's
+ * winding rule (the low 2 bits - see Draw_FillNonzero/Negative/EvenOdd/
+ * Positive in h.types). */
+static int fill_inside(int32_t winding, Draw_FillStyle fill_style)
+{
+    switch (fill_style & Draw_FillWindingRule)
+    {
+        case Draw_FillNegative:
+            return winding < 0;
+        case Draw_FillEvenOdd:
+            return (winding & 1) != 0;
+        case Draw_FillPositive:
+            return winding > 0;
+        case Draw_FillNonzero:
+        default:
+            return winding != 0;
+    }
+}
+
+/* If edge (a->b) crosses scanline y, append its crossing x-position and
+ * winding contribution to crossings[]. Horizontal edges never cross a
+ * scanline and are ignored. The lower endpoint of an edge counts as "on"
+ * the scanline and the upper does not, so a vertex shared by two edges is
+ * never counted twice. */
+static void fill_test_edge(OS_Coord a, OS_Coord b, int32_t y,
+                            Fill_Crossing *crossings, int32_t *count,
+                            int32_t max, int *overflowed)
+{
+    int32_t ymin, ymax;
+    double x;
+
+    if (a.y == b.y)
+        return;
+
+    ymin = (a.y < b.y) ? a.y : b.y;
+    ymax = (a.y < b.y) ? b.y : a.y;
+
+    if (y < ymin || y >= ymax)
+        return;
+
+    x = (double)a.x +
+        ((double)y - (double)a.y) * ((double)b.x - (double)a.x) / ((double)b.y - (double)a.y);
+
+    if (*count >= max)
+    {
+        *overflowed = 1;
+        return;
+    }
+
+    crossings[*count].x = x;
+    crossings[*count].winding = (b.y > a.y) ? 1 : -1;
+    (*count)++;
+}
+
+/* Walk the whole path once, adding every edge crossing scanline y to
+ * crossings[] - including each subpath's closing edge, whether explicit
+ * (Draw_CloseLine/Draw_CloseGap) or only implied by the subpath ending
+ * without one. Subpaths started with Draw_SpecialMoveTo are skipped
+ * entirely: their edges never contribute to the winding number. Returns
+ * the number of crossings found, or -2 if the path is not flat.
+ */
+static int32_t fill_scanline_crossings(Draw_PathElement *inpath, int32_t y,
+                                        Fill_Crossing *crossings, int32_t max,
+                                        int *overflowed)
+{
+    int32_t count = 0;
+    OS_Coord subpath_start;
+    OS_Coord prev;
+    OS_Coord here;
+    int have_open = 0;
+    int skip_subpath = 0;
+
+    subpath_start.x = 0;
+    subpath_start.y = 0;
+    prev = subpath_start;
+
+    while (inpath->tag != Draw_EndPath)
+    {
+        switch (inpath->tag)
+        {
+            case Draw_MoveTo:
+            case Draw_SpecialMoveTo:
+                if (have_open && !skip_subpath)
+                    fill_test_edge(prev, subpath_start, y, crossings, &count, max, overflowed);
+                subpath_start.x = inpath->data.move_to.x;
+                subpath_start.y = inpath->data.move_to.y;
+                prev = subpath_start;
+                have_open = 1;
+                skip_subpath = (inpath->tag == Draw_SpecialMoveTo);
+                break;
+
+            case Draw_LineTo:
+            case Draw_GapTo:
+                here.x = inpath->data.line_to.x;
+                here.y = inpath->data.line_to.y;
+                if (!skip_subpath)
+                    fill_test_edge(prev, here, y, crossings, &count, max, overflowed);
+                prev = here;
+                break;
+
+            case Draw_CloseLine:
+            case Draw_CloseGap:
+                if (!skip_subpath)
+                    fill_test_edge(prev, subpath_start, y, crossings, &count, max, overflowed);
+                prev = subpath_start;
+                have_open = 0;
+                break;
+
+            case Draw_BezierTo:
+                return -2;
+
+            default:
+                break;
+        }
+
+        inpath = advance_element(inpath);
+    }
+
+    if (have_open && !skip_subpath)
+        fill_test_edge(prev, subpath_start, y, crossings, &count, max, overflowed);
+
+    return count;
+}
+
+/* Insertion sort crossings by x - counts are small (FILL_MAX_CROSSINGS),
+ * so this is simpler and just as fast in practice as a general sort. */
+static void fill_sort_crossings(Fill_Crossing *crossings, int32_t count)
+{
+    int32_t i, j;
+
+    for (i = 1; i < count; i++)
+    {
+        Fill_Crossing key = crossings[i];
+        j = i - 1;
+        while (j >= 0 && crossings[j].x > key.x)
+        {
+            crossings[j + 1] = crossings[j];
+            j--;
+        }
+        crossings[j + 1] = key;
+    }
+}
+
+/* Find the path's lowest and highest y coordinate, over every point of
+ * every subpath (including ones started with Draw_SpecialMoveTo - they
+ * still occupy space, even though they don't affect winding), so fill()
+ * knows which scanlines to walk. */
+static void fill_ybounds(Draw_PathElement *inpath, int32_t *ymin, int32_t *ymax)
+{
+    int have_any = 0;
+
+    while (inpath->tag != Draw_EndPath)
+    {
+        int32_t y;
+        int have_y = 0;
+
+        switch (inpath->tag)
+        {
+            case Draw_MoveTo:
+            case Draw_SpecialMoveTo:
+                y = inpath->data.move_to.y;
+                have_y = 1;
+                break;
+
+            case Draw_LineTo:
+            case Draw_GapTo:
+                y = inpath->data.line_to.y;
+                have_y = 1;
+                break;
+
+            default:
+                break;
+        }
+
+        if (have_y)
+        {
+            if (!have_any || y < *ymin)
+                *ymin = y;
+            if (!have_any || y > *ymax)
+                *ymax = y;
+            have_any = 1;
+        }
+
+        inpath = advance_element(inpath);
+    }
+
+    if (!have_any)
+    {
+        *ymin = 0;
+        *ymax = 0;
+    }
+}
+
+int32_t fill(Draw_PathElement *inpath, Draw_FillStyle fill_style, int32_t step, Fill_Render *render)
+{
+    int32_t ymin, ymax, y;
+    int overflowed = 0;
+
+    if (step <= 0)
+        step = 1;
+
+    fill_ybounds(inpath, &ymin, &ymax);
+
+    for (y = ymin; y <= ymax; y += step)
+    {
+        Fill_Crossing crossings[FILL_MAX_CROSSINGS];
+        Fill_HLine spans[FILL_MAX_CROSSINGS / 2];
+        int32_t nspans = 0;
+        int32_t winding = 0;
+        int32_t span_start = 0;
+        int in_span = 0;
+        int32_t count = fill_scanline_crossings(inpath, y, crossings, FILL_MAX_CROSSINGS, &overflowed);
+        int32_t i;
+
+        if (count == -2)
+            return -2;
+
+        fill_sort_crossings(crossings, count);
+
+        for (i = 0; i < count; i++)
+        {
+            int inside_before = fill_inside(winding, fill_style);
+            int inside_after;
+
+            winding += crossings[i].winding;
+            inside_after = fill_inside(winding, fill_style);
+
+            if (!inside_before && inside_after)
+            {
+                span_start = fill_round32(crossings[i].x);
+                in_span = 1;
+            }
+            else if (inside_before && !inside_after && in_span)
+            {
+                if (nspans < (int32_t)(sizeof(spans) / sizeof(spans[0])))
+                {
+                    spans[nspans].x0 = span_start;
+                    spans[nspans].y = y;
+                    spans[nspans].x1 = fill_round32(crossings[i].x);
+                    nspans++;
+                }
+                in_span = 0;
+            }
+        }
+
+        if (nspans > 0)
+        {
+            if (render->polyhline != NULL)
+                render->polyhline(render->ctx, spans, nspans);
+            else
+            {
+                for (i = 0; i < nspans; i++)
+                    render->hline(render->ctx, spans[i].x0, spans[i].y, spans[i].x1);
+            }
+        }
+    }
+
+    return overflowed ? -1 : 0;
+}

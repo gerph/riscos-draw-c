@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 
 #include "swis.h"
 
@@ -18,12 +19,14 @@
 #include "dash.h"
 #include "thicken.h"
 #include "cap.h"
+#include "fill.h"
 
 int32_t in_buffer[1024];
 int32_t out_buffer[1024];
 
 #define FLATTENING (16)
 #define THICKNESS  (4)
+#define PI (3.14159265358979323846)
 
 /* Simple line drawing for manual debug */
 #define MOVE(_x,_y) _swix(OS_Plot, _INR(0,2), 4, _x,_y)
@@ -243,11 +246,91 @@ void test_capping(void)
     }
 }
 
+/* Dumb render callbacks for the test harness: just print and plot each run.
+ * hline is the one fill() always has available; polyhline exists here only
+ * to show it being wired up - it simply calls hline for each run in turn,
+ * since there is no batching advantage in a test program that plots to the
+ * screen one line at a time.
+ */
+static void render_hline(void *ctx, int32_t x0, int32_t y, int32_t x1)
+{
+    (void)ctx;
+    printf("hline y=%d x=%d..%d\n", (int)Y(y), (int)X(x0), (int)X(x1));
+    MOVE(X(x0), Y(y));
+    DRAW(X(x1), Y(y));
+}
+
+static void render_polyhline(void *ctx, const Fill_HLine *lines, int32_t count)
+{
+    int32_t i;
+    for (i = 0; i < count; i++)
+        render_hline(ctx, lines[i].x0, lines[i].y, lines[i].x1);
+}
+
+/* Exercises fill() with all four Draw winding rules on a self-intersecting
+ * pentagram (five points of a pentagon, joined in star order 0-2-4-1-3 as a
+ * single subpath). This is the classic shape for showing winding rules
+ * apart: every point of the star has a winding number of 1, but the centre
+ * pentagon - covered twice by the crossing path - has a winding number of
+ * 2. Non-zero and positive both fill the whole star solid; even-odd leaves
+ * the centre pentagon unfilled (2 is even); negative fills nothing at all,
+ * since the path winds the same way throughout and never goes negative.
+ */
+void test_filling(void)
+{
+    Draw_PathElement *inpath = (Draw_PathElement *)in_buffer;
+    Fill_Render render;
+    static const Draw_FillStyle rules[4] = { Draw_FillNonzero, Draw_FillEvenOdd,
+                                              Draw_FillPositive, Draw_FillNegative };
+    static const char * const names[4] = { "nonzero", "evenodd", "positive", "negative" };
+    static const int order[5] = { 0, 2, 4, 1, 3 };
+    int32_t cx = 0x9000, cy = 0x9000, radius = 0x2800;
+    int32_t vx[5], vy[5];
+    int32_t i;
+
+    for (i = 0; i < 5; i++)
+    {
+        double angle = -PI / 2.0 + (double)i * (2.0 * PI / 5.0);
+        vx[i] = cx + (int32_t)(radius * cos(angle));
+        vy[i] = cy + (int32_t)(radius * sin(angle));
+    }
+
+    ADD_MOVE(inpath, vx[order[0]], vy[order[0]]);
+    ADD_LINE(inpath, vx[order[1]], vy[order[1]]);
+    ADD_LINE(inpath, vx[order[2]], vy[order[2]]);
+    ADD_LINE(inpath, vx[order[3]], vy[order[3]]);
+    ADD_LINE(inpath, vx[order[4]], vy[order[4]]);
+    inpath->tag = Draw_CloseLine;
+    inpath = (Draw_PathElement *)(((int32_t *)inpath) + 1);
+    ADD_END(inpath, 0);
+    inpath = (Draw_PathElement *)in_buffer;
+
+    render.ctx = NULL;
+    render.hline = render_hline;
+    render.polyhline = render_polyhline;
+
+    for (i = 0; i < 4; i++)
+    {
+        int32_t result;
+
+        printf("--- fill rule: %s ---\n", names[i]);
+        result = fill(inpath, rules[i], 64, &render);
+        if (result < 0)
+            printf("fill: error %d\n", (int)result);
+        else
+            printf("fill: ok\n");
+    }
+
+    if (getenv("WAIT") != NULL)
+        WAIT();
+}
+
 int main(int argc, char *argv[])
 {
     printf("DrawFlattening " Module_FullVersionAndDate "\n");
     test_flattening();
     test_capping();
+    test_filling();
 
     exit(EXIT_SUCCESS);
 }

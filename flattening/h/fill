@@ -1,0 +1,67 @@
+/*******************************************************************
+ * File:     fill
+ * Purpose:  Scanline filling of a flattened Draw path, honouring all four
+ *           Draw winding rules
+ * Author:   Gerph
+ * Date:     24 Jul 2026
+ ******************************************************************/
+
+#ifndef FILL_H
+#define FILL_H
+
+#include "types.h"
+
+/* One horizontal run of interior pixels to plot, from x0 to x1 inclusive,
+ * on scanline y. */
+typedef struct {
+    int32_t x0;
+    int32_t y;
+    int32_t x1;
+} Fill_HLine;
+
+/* Rendering callbacks supplied by the caller of fill(). hline must always
+ * be given; polyhline is optional (NULL if not wanted) - when present,
+ * fill() batches every run on one scanline into a single polyhline call
+ * instead of calling hline once per run. ctx is passed back unchanged, for
+ * the render implementation's own use (eg a sprite pointer or plot origin).
+ */
+typedef struct {
+    void *ctx;
+    void (*hline)(void *ctx, int32_t x0, int32_t y, int32_t x1);
+    void (*polyhline)(void *ctx, const Fill_HLine *lines, int32_t count);
+} Fill_Render;
+
+/*************************************************** Gerph *********
+ Function:      fill
+ Description:   Rasterise the interior of a flattened path with a scanline
+                fill, calling render->hline (or render->polyhline, when
+                given) for each horizontal run of interior pixels on every
+                scanline between the path's lowest and highest y. Every
+                subpath is treated as implicitly closed by a straight edge
+                back to its start point for winding purposes - matching
+                Draw_Fill's PostScript-equivalent behaviour - regardless of
+                whether it ends with an explicit Close element. A subpath
+                started with Draw_SpecialMoveTo contributes no edges at all,
+                since by definition it does not affect winding numbers.
+ Parameters:    inpath-> the flattened path to fill (must contain no
+                         Draw_BezierTo elements)
+                fill_style = winding rule, taken from the low 2 bits (see
+                             Draw_FillNonzero/Negative/EvenOdd/Positive in
+                             h.types) - the other Draw_FillStyle bits
+                             (boundary pixel control, flatten/thicken/close
+                             on entry, etc) are not implemented here; the
+                             caller is expected to have already flattened
+                             (and thickened/capped, if stroking) the path
+                step = distance in path units between successive scanlines;
+                       must be positive
+                render-> the render callbacks to call for each interior run
+ Returns:       0 on success; -1 if one or more scanlines produced more
+                edge crossings than could be tracked at once (see
+                FILL_MAX_CROSSINGS in c.fill) - filling continues on a
+                best-effort basis past this, but the affected scanlines may
+                be incomplete; -2 if inpath contains a Draw_BezierTo (the
+                path is not flat, so cannot be filled)
+ ******************************************************************/
+int32_t fill(Draw_PathElement *inpath, Draw_FillStyle fill_style, int32_t step, Fill_Render *render);
+
+#endif
