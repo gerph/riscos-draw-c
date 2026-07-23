@@ -22,8 +22,9 @@ int32_t out_buffer[256];
 #define FLATTENING (16)
 #define THICKNESS  (4)
 
-/* Maximum distinct vertices buffered for a single subpath while thickening. */
-#define THICKEN_MAX_POINTS (64)
+/* Maximum distinct vertices buffered for a single subpath while thickening
+ * or dashing. */
+#define PATH_MAX_POINTS (64)
 /* Ratio of mitre length to line width beyond which a corner is bevelled
  * instead of mitred, matching the sense of Draw_LineStyle's mitre_limit. */
 #define THICKEN_MITRE_LIMIT (4.0)
@@ -419,22 +420,22 @@ static int join_points(Vec2 V, Vec2 dir_in, Vec2 dir_out,
 
 
 typedef struct {
-    OS_Coord pts[THICKEN_MAX_POINTS];
+    OS_Coord pts[PATH_MAX_POINTS];
     int32_t  count;
-    int32_t  closed;
+    Draw_Tag close_tag;   /* 0 (open), Draw_CloseLine or Draw_CloseGap */
 } Subpath;
 
 /* Append a point, skipping it if it exactly repeats the previous one (a
  * zero-length segment) - this keeps degenerate input from producing
  * zero-length directions later on.
  */
-static void thicken_add_point(Subpath *sp, int32_t x, int32_t y)
+static void subpath_add_point(Subpath *sp, int32_t x, int32_t y)
 {
     if (sp->count > 0 &&
         sp->pts[sp->count - 1].x == x && sp->pts[sp->count - 1].y == y)
         return;
 
-    if (sp->count < THICKEN_MAX_POINTS)
+    if (sp->count < PATH_MAX_POINTS)
     {
         sp->pts[sp->count].x = x;
         sp->pts[sp->count].y = y;
@@ -443,26 +444,27 @@ static void thicken_add_point(Subpath *sp, int32_t x, int32_t y)
 }
 
 /* Read one subpath starting at inpath (which must be a MoveTo or
- * SpecialMoveTo), collecting its distinct vertices into sp. Returns the
- * element following the subpath (the next MoveTo or the EndPath).
+ * SpecialMoveTo and must not yet contain any GapTo elements - ie this is for
+ * reading a plain, undashed path), collecting its distinct vertices into sp.
+ * Returns the element following the subpath (the next MoveTo or EndPath).
  */
-static Draw_PathElement *thicken_read_subpath(Draw_PathElement *inpath, Subpath *sp)
+static Draw_PathElement *path_read_subpath(Draw_PathElement *inpath, Subpath *sp)
 {
     sp->count = 0;
-    sp->closed = 0;
+    sp->close_tag = 0;
 
-    thicken_add_point(sp, inpath->data.move_to.x, inpath->data.move_to.y);
+    subpath_add_point(sp, inpath->data.move_to.x, inpath->data.move_to.y);
     inpath = advance_element(inpath);
 
-    while (inpath->tag == Draw_LineTo || inpath->tag == Draw_GapTo)
+    while (inpath->tag == Draw_LineTo)
     {
-        thicken_add_point(sp, inpath->data.line_to.x, inpath->data.line_to.y);
+        subpath_add_point(sp, inpath->data.line_to.x, inpath->data.line_to.y);
         inpath = advance_element(inpath);
     }
 
     if (inpath->tag == Draw_CloseGap || inpath->tag == Draw_CloseLine)
     {
-        sp->closed = 1;
+        sp->close_tag = inpath->tag;
         inpath = advance_element(inpath);
 
         /* An explicit line back to the start point is redundant once closed */
@@ -569,6 +571,19 @@ static Draw_PathElement *emit_line(Draw_PathElement *out, int32_t *space_remaini
     return out;
 }
 
+static Draw_PathElement *emit_gap(Draw_PathElement *out, int32_t *space_remaining, OS_Coord p)
+{
+    if (*space_remaining >= (int32_t)(sizeof(int32_t) * 3))
+    {
+        out->tag = Draw_GapTo;
+        out->data.gap_to.x = p.x;
+        out->data.gap_to.y = p.y;
+        out = (Draw_PathElement *)(((int32_t *)out) + 3);
+        *space_remaining -= (int32_t)(sizeof(int32_t) * 3);
+    }
+    return out;
+}
+
 static Draw_PathElement *emit_close(Draw_PathElement *out, int32_t *space_remaining)
 {
     if (*space_remaining >= (int32_t)(sizeof(int32_t) * 1))
@@ -587,8 +602,8 @@ static Draw_PathElement *emit_close(Draw_PathElement *out, int32_t *space_remain
 static Draw_PathElement *thicken_emit_open(Subpath *sp, double half_thick,
                                             Draw_PathElement *out, int32_t *space_remaining)
 {
-    Vec2 left[2 * THICKEN_MAX_POINTS];
-    Vec2 right[2 * THICKEN_MAX_POINTS];
+    Vec2 left[2 * PATH_MAX_POINTS];
+    Vec2 right[2 * PATH_MAX_POINTS];
     int32_t nl = side_offset_open(sp, 1.0, half_thick, left);
     int32_t nr = side_offset_open(sp, -1.0, half_thick, right);
     int32_t i;
@@ -612,8 +627,8 @@ static Draw_PathElement *thicken_emit_open(Subpath *sp, double half_thick,
 static Draw_PathElement *thicken_emit_closed(Subpath *sp, double half_thick,
                                               Draw_PathElement *out, int32_t *space_remaining)
 {
-    Vec2 left[2 * THICKEN_MAX_POINTS];
-    Vec2 right[2 * THICKEN_MAX_POINTS];
+    Vec2 left[2 * PATH_MAX_POINTS];
+    Vec2 right[2 * PATH_MAX_POINTS];
     int32_t nl = side_offset_closed(sp, 1.0, half_thick, left);
     int32_t nr = side_offset_closed(sp, -1.0, half_thick, right);
     int32_t i;
@@ -637,10 +652,130 @@ static Draw_PathElement *thicken_emit_closed(Subpath *sp, double half_thick,
     return out;
 }
 
-/* Thicken a flattened Draw path (MoveTo/LineTo, optionally closed with
+/* A path being thickened may already have gaps in it (from dash()): a
+ * GapTo, or a closing edge of CloseGap. Unlike Subpath, GappedPath keeps
+ * every vertex - including the ones either side of a gap - along with a
+ * flag for whether the edge leading into it is a gap (unstroked) or a real
+ * line.
+ */
+typedef struct {
+    OS_Coord pts[PATH_MAX_POINTS];
+    uint8_t  gap_before[PATH_MAX_POINTS]; /* gap_before[i]: edge pts[i-1]->pts[i] is unstroked; [0] unused */
+    int32_t  count;
+} GappedPath;
+
+static void gapped_path_add(GappedPath *gp, int32_t x, int32_t y, int32_t is_gap_edge)
+{
+    if (gp->count > 0 && !is_gap_edge &&
+        gp->pts[gp->count - 1].x == x && gp->pts[gp->count - 1].y == y)
+        return;
+
+    if (gp->count < PATH_MAX_POINTS)
+    {
+        gp->pts[gp->count].x = x;
+        gp->pts[gp->count].y = y;
+        gp->gap_before[gp->count] = (uint8_t)(is_gap_edge != 0);
+        gp->count++;
+    }
+}
+
+/* Read one subpath starting at inpath (a MoveTo or SpecialMoveTo), which may
+ * contain GapTo elements and be closed with CloseGap as well as CloseLine.
+ * A CloseLine appends the start point back on as a real edge; a CloseGap
+ * appends it as a gap edge (ie it is never stroked), matching the fact that
+ * "close with a gap" draws no line for that edge. Returns the element
+ * following the subpath.
+ */
+static Draw_PathElement *thicken_read_gapped_subpath(Draw_PathElement *inpath, GappedPath *gp)
+{
+    gp->count = 0;
+
+    gapped_path_add(gp, inpath->data.move_to.x, inpath->data.move_to.y, 0);
+    inpath = advance_element(inpath);
+
+    while (inpath->tag == Draw_LineTo || inpath->tag == Draw_GapTo)
+    {
+        gapped_path_add(gp, inpath->data.line_to.x, inpath->data.line_to.y,
+                         inpath->tag == Draw_GapTo);
+        inpath = advance_element(inpath);
+    }
+
+    if (inpath->tag == Draw_CloseGap || inpath->tag == Draw_CloseLine)
+    {
+        if (gp->count > 0)
+            gapped_path_add(gp, gp->pts[0].x, gp->pts[0].y, inpath->tag == Draw_CloseGap);
+        inpath = advance_element(inpath);
+    }
+
+    return inpath;
+}
+
+/* Thicken one already-parsed subpath, which may contain gaps. A single run
+ * that loops back to its own start point with no gaps anywhere is a proper
+ * closed ring (mitred/bevelled all the way round); anything else is broken
+ * at each gap into independent, individually-capped open runs.
+ */
+static Draw_PathElement *thicken_process_gapped(GappedPath *gp, double half_thick,
+                                                 Draw_PathElement *out, int32_t *space_remaining)
+{
+    int32_t n = gp->count;
+    int32_t i;
+
+    if (n < 2)
+        return out;
+
+    if (n >= 3)
+    {
+        int32_t any_gap = 0;
+        for (i = 1; i < n; i++)
+        {
+            if (gp->gap_before[i])
+            {
+                any_gap = 1;
+                break;
+            }
+        }
+
+        if (!any_gap &&
+            gp->pts[0].x == gp->pts[n - 1].x && gp->pts[0].y == gp->pts[n - 1].y)
+        {
+            Subpath ring;
+            ring.count = n - 1;
+            ring.close_tag = Draw_CloseLine;
+            memcpy(ring.pts, gp->pts, sizeof(OS_Coord) * ring.count);
+            return thicken_emit_closed(&ring, half_thick, out, space_remaining);
+        }
+    }
+
+    {
+        int32_t run_start = 0;
+        for (i = 1; i <= n; i++)
+        {
+            if (i == n || gp->gap_before[i])
+            {
+                int32_t run_count = i - run_start;
+                if (run_count >= 2)
+                {
+                    Subpath run;
+                    run.count = run_count;
+                    memcpy(run.pts, gp->pts + run_start, sizeof(OS_Coord) * run_count);
+                    out = thicken_emit_open(&run, half_thick, out, space_remaining);
+                }
+                run_start = i;
+            }
+        }
+    }
+
+    return out;
+}
+
+/* Thicken a flattened Draw path (MoveTo/LineTo/GapTo, optionally closed with
  * CloseGap/CloseLine) into a filled outline path, THICKNESS wide and
- * centred on the original lines.
- * inpath:    source path (read-only), already flattened
+ * centred on the original lines. GapTo runs and a CloseGap's closing edge
+ * are not stroked, exactly as Draw's own definition of a gap requires -
+ * this is what lets a dashed path (see dash()) thicken correctly.
+ * inpath:    source path (read-only), already flattened (and optionally
+ *            dashed)
  * outpath:   output buffer, initially holding a single EndPath whose
  *            end_path field contains the number of bytes available after it
  * thickness: overall width of the thickened band (THICKNESS/2 either side
@@ -654,7 +789,7 @@ void thicken(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickn
 
     while (inpath->tag != Draw_EndPath)
     {
-        Subpath sp;
+        GappedPath gp;
 
         if (inpath->tag != Draw_MoveTo && inpath->tag != Draw_SpecialMoveTo)
         {
@@ -663,22 +798,241 @@ void thicken(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickn
             continue;
         }
 
-        inpath = thicken_read_subpath(inpath, &sp);
+        inpath = thicken_read_gapped_subpath(inpath, &gp);
 
-        if (sp.count < 2 || half_thick <= 0.0)
-        {
-            /* Degenerate subpath (a single point, or no thickness): there is
-             * nothing sensible to draw for it. */
-            continue;
-        }
-
-        if (sp.closed)
-            out = thicken_emit_closed(&sp, half_thick, out, &space_remaining);
-        else
-            out = thicken_emit_open(&sp, half_thick, out, &space_remaining);
+        if (half_thick > 0.0)
+            out = thicken_process_gapped(&gp, half_thick, out, &space_remaining);
     }
 
     /* Write the closing EndPath element */
+    out->tag = Draw_EndPath;
+    out->data.end_path = space_remaining - (int32_t)(sizeof(int32_t) * 2);
+}
+
+
+/* ------------------------------------------------------------------------
+ * Dashing
+ *
+ * Splits a flattened path into on/off runs following a dash pattern. "Off"
+ * runs become GapTo elements rather than separate subpaths, exactly
+ * matching Draw's own definition of a gap ("do not start a new subpath") -
+ * this keeps a single subpath's Move/Close structure intact through
+ * dashing, and is exactly what thicken() above already knows how to stroke
+ * (it treats GapTo, and a CloseGap's closing edge, as unstroked breaks).
+ *
+ * A closed subpath's closing edge is walked as part of the same pattern if
+ * it is a CloseLine (a CloseGap's closing edge is never drawn, so it is
+ * excluded, just as it is when thickening). The pattern is not specially
+ * re-synchronised at that seam: as with most vector renderers, the dash run
+ * that reaches back round to the start point is simply capped there like
+ * any other, rather than merged with the first run.
+ * ------------------------------------------------------------------------
+ */
+
+typedef struct {
+    const int32_t *elements;
+    int32_t count;      /* 0 means "no usable pattern" - draw solid */
+    int32_t index;      /* which element we are currently within */
+    int32_t on;         /* is that element drawn ("on") or a gap? */
+    double  remaining;  /* distance left to travel within the current element */
+} DashState;
+
+/* Skip forward over any non-positive elements (which have nothing to
+ * consume) until ds->index names a usable one, then load its length.
+ * Relies on the caller having already checked at least one element is
+ * positive, so this cannot spin forever.
+ */
+static void dash_state_reset_element(DashState *ds)
+{
+    while (ds->elements[ds->index] <= 0)
+    {
+        ds->index = (ds->index + 1) % ds->count;
+        ds->on = !ds->on;
+    }
+    ds->remaining = (double)ds->elements[ds->index];
+}
+
+static void dash_state_advance(DashState *ds)
+{
+    ds->index = (ds->index + 1) % ds->count;
+    ds->on = !ds->on;
+    dash_state_reset_element(ds);
+}
+
+/* Set up a DashState at the start of a pattern, pre-consuming 'start'
+ * distance so the dash pattern's phase offset takes effect. ds->count is
+ * left as 0 if the pattern has no positive-length elements at all (eg n=0,
+ * or every element is zero or negative) - a meaningless pattern that is
+ * handled the same as no pattern, rather than looping forever.
+ */
+static void dash_state_init(DashState *ds, Draw_DashPattern *pattern)
+{
+    double phase;
+    int32_t i;
+    int32_t has_positive = 0;
+
+    ds->elements = pattern->elements;
+    ds->count = pattern->element_count;
+    ds->index = 0;
+    ds->on = 1;
+    ds->remaining = 0.0;
+
+    if (ds->count <= 0)
+    {
+        ds->count = 0;
+        return;
+    }
+
+    for (i = 0; i < ds->count; i++)
+    {
+        if (ds->elements[i] > 0)
+        {
+            has_positive = 1;
+            break;
+        }
+    }
+    if (!has_positive)
+    {
+        ds->count = 0;
+        return;
+    }
+
+    dash_state_reset_element(ds);
+
+    phase = (double)pattern->start;
+    while (phase > 0.0)
+    {
+        if (phase < ds->remaining)
+        {
+            ds->remaining -= phase;
+            phase = 0.0;
+        }
+        else
+        {
+            phase -= ds->remaining;
+            dash_state_advance(ds);
+        }
+    }
+}
+
+/* Walk points[0..n-1] as a single polyline, applying and updating the dash
+ * state in ds, emitting LineTo for "on" runs and GapTo for "off" runs.
+ * The caller has already written the subpath's initial MoveTo.
+ */
+static Draw_PathElement *dash_walk(OS_Coord *points, int32_t n, DashState *ds,
+                                    Draw_PathElement *out, int32_t *space_remaining)
+{
+    int32_t i;
+
+    for (i = 0; i < n - 1; i++)
+    {
+        Vec2 a = coord_to_vec(points[i]);
+        Vec2 b = coord_to_vec(points[i + 1]);
+        double seg_len = sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y));
+        double seg_pos = 0.0;
+
+        while (seg_pos < seg_len)
+        {
+            double step = ds->remaining;
+            Vec2 p;
+
+            if (step > seg_len - seg_pos)
+                step = seg_len - seg_pos;
+            seg_pos += step;
+            ds->remaining -= step;
+
+            p.x = a.x + (b.x - a.x) * (seg_pos / seg_len);
+            p.y = a.y + (b.y - a.y) * (seg_pos / seg_len);
+
+            out = ds->on ? emit_line(out, space_remaining, vec_to_coord(p))
+                         : emit_gap(out, space_remaining, vec_to_coord(p));
+
+            if (ds->remaining <= 1e-6)
+                dash_state_advance(ds);
+        }
+    }
+
+    return out;
+}
+
+/* Apply a dash pattern to a flattened path, replacing "off" sections with
+ * GapTo elements (see the section comment above for why, and how thicken()
+ * consumes them).
+ * inpath:   source path (read-only), already flattened
+ * outpath:  output buffer, initially holding a single EndPath whose
+ *           end_path field contains the number of bytes available after it
+ * pattern:  the dash pattern to apply, or NULL for no dashes, in which case
+ *           the path is copied through unchanged (matching Draw's own R6=0
+ *           convention of "no dashes")
+ */
+void dash(Draw_PathElement *inpath, Draw_PathElement *outpath, Draw_DashPattern *pattern)
+{
+    Draw_PathElement *out = outpath;
+    int32_t space_remaining = outpath->data.end_path;
+    DashState ds_template;
+    int32_t have_pattern = 0;
+
+    if (pattern != NULL)
+    {
+        dash_state_init(&ds_template, pattern);
+        have_pattern = (ds_template.count > 0);
+    }
+
+    while (inpath->tag != Draw_EndPath)
+    {
+        Subpath sp;
+
+        if (inpath->tag != Draw_MoveTo && inpath->tag != Draw_SpecialMoveTo)
+        {
+            inpath = advance_element(inpath);
+            continue;
+        }
+
+        inpath = path_read_subpath(inpath, &sp);
+
+        if (sp.count < 1)
+            continue;
+
+        if (!have_pattern || sp.count < 2)
+        {
+            /* No usable pattern, or nothing to dash: copy through unchanged */
+            int32_t i;
+            out = emit_move(out, &space_remaining, sp.pts[0]);
+            for (i = 1; i < sp.count; i++)
+                out = emit_line(out, &space_remaining, sp.pts[i]);
+            if (sp.close_tag == Draw_CloseLine)
+                out = emit_close(out, &space_remaining);
+            else if (sp.close_tag == Draw_CloseGap &&
+                     space_remaining >= (int32_t)(sizeof(int32_t) * 1))
+            {
+                out->tag = Draw_CloseGap;
+                out = (Draw_PathElement *)(((int32_t *)out) + 1);
+                space_remaining -= (int32_t)(sizeof(int32_t) * 1);
+            }
+            continue;
+        }
+
+        {
+            DashState ds = ds_template;
+
+            out = emit_move(out, &space_remaining, sp.pts[0]);
+            out = dash_walk(sp.pts, sp.count, &ds, out, &space_remaining);
+
+            if (sp.close_tag == Draw_CloseLine)
+            {
+                /* Walk the closing edge too, continuing the same pattern */
+                OS_Coord seg[2];
+                seg[0] = sp.pts[sp.count - 1];
+                seg[1] = sp.pts[0];
+                out = dash_walk(seg, 2, &ds, out, &space_remaining);
+            }
+            /* A CloseGap's closing edge is never drawn, so it is left out
+             * here too, exactly as it is when thickening. Either way, the
+             * result is no longer topologically closed - it is left as an
+             * open run of Line/GapTo elements, which is what it now is. */
+        }
+    }
+
     out->tag = Draw_EndPath;
     out->data.end_path = space_remaining - (int32_t)(sizeof(int32_t) * 2);
 }
@@ -729,6 +1083,22 @@ void test_flattening(void)
     /* The out_buffer now contains a single 'END' which contains the length of the data */
 
     flatten(inpath, outpath, FLATTENING);
+
+    /* Reset things so that we can do dashing */
+    memcpy(in_buffer, out_buffer, sizeof(out_buffer));
+    outpath = (Draw_PathElement *)out_buffer;
+    ADD_END(outpath, sizeof(out_buffer) - sizeof(int32_t)*2);
+    outpath = (Draw_PathElement *)out_buffer;
+
+    {
+        struct {
+            int32_t start;
+            int32_t element_count;
+            int32_t elements[2];
+        } test_dash_pattern = { 0, 2, { 1200, 600 } };
+
+        dash(inpath, outpath, (Draw_DashPattern *)&test_dash_pattern);
+    }
 
     /* Reset things so that we can do thickening */
     memcpy(in_buffer, out_buffer, sizeof(out_buffer));
