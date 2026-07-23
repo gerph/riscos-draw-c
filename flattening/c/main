@@ -595,11 +595,97 @@ static Draw_PathElement *emit_close(Draw_PathElement *out, int32_t *space_remain
     return out;
 }
 
+/* Emit the geometry for one line cap. 'from' has already been emitted by
+ * the caller; this always finishes by emitting 'to' itself, so the pen ends
+ * up exactly there regardless of style - callers don't need to special-case
+ * the butt style.
+ *
+ * P is the path endpoint the cap surrounds; perp is the unit normal with
+ * from == P + half_thick*perp (so to == P - half_thick*perp); dir is the
+ * unit direction the cap projects into, away from the stroked line (ie
+ * outward continuation for an end cap, backward continuation for a start
+ * cap). width/length are Draw_LineStyle's triangular cap settings, in
+ * 256ths of the line width (THICKNESS, ie 2*half_thick).
+ */
+static Draw_PathElement *cap_emit(Draw_PathElement *out, int32_t *space_remaining,
+                                   Vec2 from, Vec2 to, Vec2 P, Vec2 perp, Vec2 dir,
+                                   double half_thick, Draw_CapStyle style,
+                                   int32_t width_256, int32_t length_256)
+{
+    double line_width = half_thick * 2.0;
+
+    switch (style)
+    {
+        case Draw_CapRound:
+        {
+            /* Semicircle from 'from', through the outward bulge, to 'to' -
+             * approximated with a handful of flat segments, matching the
+             * rest of this project's flatten-early approach. */
+            const int32_t STEPS = 8;
+            int32_t i;
+            for (i = 1; i < STEPS; i++)
+            {
+                double t = 3.14159265358979323846 * (double)i / (double)STEPS;
+                Vec2 p;
+                p.x = P.x + half_thick * (perp.x * cos(t) + dir.x * sin(t));
+                p.y = P.y + half_thick * (perp.y * cos(t) + dir.y * sin(t));
+                out = emit_line(out, space_remaining, vec_to_coord(p));
+            }
+            break;
+        }
+
+        case Draw_CapSquare:
+        {
+            /* Projects both shoulders out by half the line width, giving a
+             * flat cap that stands proud of the endpoint rather than
+             * sitting flush with it. */
+            Vec2 p1, p2;
+            p1.x = from.x + dir.x * half_thick;
+            p1.y = from.y + dir.y * half_thick;
+            p2.x = to.x   + dir.x * half_thick;
+            p2.y = to.y   + dir.y * half_thick;
+            out = emit_line(out, space_remaining, vec_to_coord(p1));
+            out = emit_line(out, space_remaining, vec_to_coord(p2));
+            break;
+        }
+
+        case Draw_CapTriangular:
+        {
+            /* An arrowhead-style point, with the base width and how far the
+             * apex stands away from the line both independently settable,
+             * as fractions of the line width. */
+            Vec2 base1, apex, base2;
+            double w = line_width * ((double)width_256 / 256.0);
+            double l = line_width * ((double)length_256 / 256.0);
+            base1.x = P.x + perp.x * w;
+            base1.y = P.y + perp.y * w;
+            apex.x  = P.x + dir.x * l;
+            apex.y  = P.y + dir.y * l;
+            base2.x = P.x - perp.x * w;
+            base2.y = P.y - perp.y * w;
+            out = emit_line(out, space_remaining, vec_to_coord(base1));
+            out = emit_line(out, space_remaining, vec_to_coord(apex));
+            out = emit_line(out, space_remaining, vec_to_coord(base2));
+            break;
+        }
+
+        case Draw_CapButt:
+        default:
+            break;
+    }
+
+    return emit_line(out, space_remaining, vec_to_coord(to));
+}
+
 /* Emit an open subpath as a single closed loop: out along the left offset,
- * a butt-cap straight across to the right offset, back along the right
- * offset, then CloseLine butt-caps straight back to the start.
+ * across to the right offset, back along the right offset, then closing
+ * back to the start. The end and start crossings are line caps - see
+ * cap_emit() below - and are plain butt caps (a straight line across) when
+ * style is NULL, which is what thicken() below always passes; cap() passes
+ * a real style to get round/square/triangular caps instead.
  */
 static Draw_PathElement *thicken_emit_open(Subpath *sp, double half_thick,
+                                            Draw_LineStyle *style,
                                             Draw_PathElement *out, int32_t *space_remaining)
 {
     Vec2 left[2 * PATH_MAX_POINTS];
@@ -614,8 +700,42 @@ static Draw_PathElement *thicken_emit_open(Subpath *sp, double half_thick,
     out = emit_move(out, space_remaining, vec_to_coord(left[0]));
     for (i = 1; i < nl; i++)
         out = emit_line(out, space_remaining, vec_to_coord(left[i]));
-    for (i = nr - 1; i >= 0; i--)
+
+    if (style != NULL)
+    {
+        /* End cap: the line was travelling in this direction when it
+         * reached its last point, and the cap projects further that way. */
+        Vec2 P = coord_to_vec(sp->pts[sp->count - 1]);
+        Vec2 dir = unit_dir(sp->pts[sp->count - 2], sp->pts[sp->count - 1]);
+        Vec2 perp;
+        perp.x = -dir.y;
+        perp.y = dir.x;
+        out = cap_emit(out, space_remaining, left[nl - 1], right[nr - 1], P, perp, dir,
+                        half_thick, style->end_cap_style,
+                        style->end_cap_width, style->end_cap_length);
+    }
+    else
+        out = emit_line(out, space_remaining, vec_to_coord(right[nr - 1]));
+
+    for (i = nr - 2; i >= 0; i--)
         out = emit_line(out, space_remaining, vec_to_coord(right[i]));
+
+    if (style != NULL)
+    {
+        /* Start cap: projects backwards, away from the direction the line
+         * heads off in from its first point. */
+        Vec2 P = coord_to_vec(sp->pts[0]);
+        Vec2 dir = unit_dir(sp->pts[0], sp->pts[1]);
+        Vec2 perp, out_dir;
+        perp.x = dir.y;
+        perp.y = -dir.x;
+        out_dir.x = -dir.x;
+        out_dir.y = -dir.y;
+        out = cap_emit(out, space_remaining, right[0], left[0], P, perp, out_dir,
+                        half_thick, style->start_cap_style,
+                        style->start_cap_width, style->start_cap_length);
+    }
+
     out = emit_close(out, space_remaining);
 
     return out;
@@ -716,6 +836,7 @@ static Draw_PathElement *thicken_read_gapped_subpath(Draw_PathElement *inpath, G
  * at each gap into independent, individually-capped open runs.
  */
 static Draw_PathElement *thicken_process_gapped(GappedPath *gp, double half_thick,
+                                                 Draw_LineStyle *style,
                                                  Draw_PathElement *out, int32_t *space_remaining)
 {
     int32_t n = gp->count;
@@ -759,7 +880,7 @@ static Draw_PathElement *thicken_process_gapped(GappedPath *gp, double half_thic
                     Subpath run;
                     run.count = run_count;
                     memcpy(run.pts, gp->pts + run_start, sizeof(OS_Coord) * run_count);
-                    out = thicken_emit_open(&run, half_thick, out, space_remaining);
+                    out = thicken_emit_open(&run, half_thick, style, out, space_remaining);
                 }
                 run_start = i;
             }
@@ -801,10 +922,73 @@ void thicken(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickn
         inpath = thicken_read_gapped_subpath(inpath, &gp);
 
         if (half_thick > 0.0)
-            out = thicken_process_gapped(&gp, half_thick, out, &space_remaining);
+            out = thicken_process_gapped(&gp, half_thick, NULL, out, &space_remaining);
     }
 
     /* Write the closing EndPath element */
+    out->tag = Draw_EndPath;
+    out->data.end_path = space_remaining - (int32_t)(sizeof(int32_t) * 2);
+}
+
+
+/* ------------------------------------------------------------------------
+ * Capping
+ *
+ * Line caps only make sense at the same moment the offset geometry either
+ * side of them is being generated - by the time thicken() has closed an
+ * open run off into its final loop of plain LineTo elements, there is no
+ * way to tell a cap edge apart from an ordinary side edge just by looking
+ * at the coordinates. So rather than reprocess thicken()'s already-closed
+ * output, cap() reruns the same offset/join engine as thicken() (sharing
+ * all of its helper functions above) and asks it to finish each open run's
+ * two ends with the requested Draw_LineStyle cap geometry instead of a
+ * plain butt line. Closed rings are unaffected, since a closed subpath has
+ * no ends to cap.
+ * ------------------------------------------------------------------------
+ */
+
+/* Thicken a flattened (and optionally dashed) Draw path exactly as
+ * thicken() does, except that the ends of open runs are finished with the
+ * cap style described by 'style' (matching Draw_Stroke's own cap and join
+ * block) instead of a plain butt line.
+ * inpath:    source path (read-only), already flattened (and optionally
+ *            dashed)
+ * outpath:   output buffer, initially holding a single EndPath whose
+ *            end_path field contains the number of bytes available after it
+ * thickness: overall width of the thickened band (THICKNESS/2 either side
+ *            of the original line)
+ * style:     start/end cap styles (and, for triangular caps, their width
+ *            and length) to apply; NULL behaves exactly like thicken()
+ */
+void cap(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickness,
+         Draw_LineStyle *style)
+{
+    Draw_PathElement *out = outpath;
+    int32_t space_remaining = outpath->data.end_path;
+    double half_thick = thickness / 2.0;
+
+    if (style == NULL)
+    {
+        thicken(inpath, outpath, thickness);
+        return;
+    }
+
+    while (inpath->tag != Draw_EndPath)
+    {
+        GappedPath gp;
+
+        if (inpath->tag != Draw_MoveTo && inpath->tag != Draw_SpecialMoveTo)
+        {
+            inpath = advance_element(inpath);
+            continue;
+        }
+
+        inpath = thicken_read_gapped_subpath(inpath, &gp);
+
+        if (half_thick > 0.0)
+            out = thicken_process_gapped(&gp, half_thick, style, out, &space_remaining);
+    }
+
     out->tag = Draw_EndPath;
     out->data.end_path = space_remaining - (int32_t)(sizeof(int32_t) * 2);
 }
@@ -1113,10 +1297,57 @@ void test_flattening(void)
         WAIT();
 }
 
+
+/* Exercises cap() with each of Draw's four cap styles on the same bent
+ * open line (so join and cap geometry both show up), one style per call.
+ * Uses ADD_MOVE/ADD_LINE/ADD_END, defined above in test_flattening().
+ */
+void test_capping(void)
+{
+    static const Draw_CapStyle styles[4] = { Draw_CapButt, Draw_CapRound,
+                                              Draw_CapSquare, Draw_CapTriangular };
+    static const char * const names[4] = { "butt", "round", "square", "triangular" };
+    const int32_t cap_thickness = 3000;
+    int32_t i;
+
+    for (i = 0; i < 4; i++)
+    {
+        Draw_PathElement *inpath = (Draw_PathElement *)in_buffer;
+        Draw_PathElement *outpath = (Draw_PathElement *)out_buffer;
+        Draw_LineStyle style;
+        int32_t y = 0x1000 + i * 0x2800;
+
+        ADD_MOVE(inpath, 0x2000, y);
+        ADD_LINE(inpath, 0x6000, y);
+        ADD_LINE(inpath, 0x6000, y + 0x1800);
+        ADD_END(inpath, 0);
+        inpath = (Draw_PathElement *)in_buffer;
+
+        ADD_END(outpath, sizeof(out_buffer) - sizeof(int32_t)*2);
+        outpath = (Draw_PathElement *)out_buffer;
+
+        style.join_style = Draw_JoinMitred;
+        style.start_cap_style = styles[i];
+        style.end_cap_style = styles[i];
+        style.reserved = 0;
+        style.mitre_limit = 0;
+        style.start_cap_width = 128;   /* 0.5 linewidth: flush with the stroke edge */
+        style.start_cap_length = 192;  /* 0.75 linewidth */
+        style.end_cap_width = 128;
+        style.end_cap_length = 192;
+
+        cap(inpath, outpath, cap_thickness, &style);
+
+        printf("--- cap style: %s ---\n", names[i]);
+        show_path(outpath);
+    }
+}
+
 int main(int argc, char *argv[])
 {
     printf("DrawFlattening " Module_FullVersionAndDate "\n");
     test_flattening();
+    test_capping();
 
     exit(EXIT_SUCCESS);
 }
