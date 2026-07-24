@@ -49,6 +49,10 @@ h/dash,     c/dash       dash() - applies a Draw_DashPattern
 h/fill,     c/fill       fill() - scanline rasterisation of a flattened path,
                          honouring all four Draw winding rules; calls back
                          through a caller-supplied Fill_Render (hline/polyhline)
+h/transform, c/transform transform() - applies an OS_Trfm matrix to every
+                         coordinate in a path (including BezierTo control
+                         points - the one stage that doesn't need a
+                         flattened input first)
 
 h/thicken_internal      GappedPath + thicken_read_gapped_subpath() +
                          thicken_process_gapped(), exposed ONLY for c/cap to reuse -
@@ -165,28 +169,79 @@ algorithms change.
 
 ## Module integration status
 
+The module is wired up and working - `c/module`'s SWI veneers call straight
+into the pipeline, and this has been verified against the actual built
+module (`rm32/Draw`), not just `c/test`: `RMLoad`ed and driven via BASIC
+`SYS` calls, `Draw_Fill` and `Draw_Stroke` both render correctly on screen,
+and `Draw_FlattenPath`/`Draw_TransformPath`/`Draw_StrokePath`/
+`Draw_ProcessPath` were checked numerically (exact byte counts for a known
+input, an exactly-translated coordinate through a real matrix, and a real
+result agreeing with its own size-query mode).
+
 * **Floating point.** The pipeline originally used `double` (sqrt/sin/cos)
   throughout - fine for a standalone AIF, but modules shouldn't use FP
   without wrapping SVC-mode entry with `Asm/fpsvc.h` save/restore (see
-  `using-libasm`). Rather than do that, the geometry/thicken/cap/dash/fill
-  maths is being reworked to integer/fixed-point so the module never touches
-  the FPU at all. Track progress on this in the code itself (`h/geometry`'s
-  `Vec2` and friends) rather than here, since this note will go stale fast.
-* **SWI wiring.** `c/module`'s veneers decode registers and are being filled
-  in to call the pipeline functions above. `Draw_FlattenPath`,
-  `Draw_TransformPath`, `Draw_StrokePath` and `Draw_ProcessPath`'s
-  buffer-output mode write to an output path buffer, exactly like the
-  pipeline already does. `Draw_Fill`/`Draw_Stroke` render straight to the
-  VDU - these are backed by an `OS_Plot`-based `Fill_Render` implemented in
-  `c/module` (or a dedicated file - check current layout) that turns
-  `fill()`'s hline/polyhline callbacks into real screen output.
-  `Draw_FillClipped`/`Draw_StrokeClipped` (RISC OS 5+, clip descriptors) and
-  the FP-vector SWI slots (`Draw_1`, `Draw_3`, ... - the unnamed odd-numbered
-  entries in the swi-decoding-table) are out of scope for now and continue
-  to report `err_DrawUnimplementedDraw`/`error_BAD_SWI` as they did before
-  this work started. The "DrawV" vector-claiming mechanism (`DrawV_Reason`
-  in `h/types`, for printer drivers etc. to intercept Draw calls) is also
-  out of scope for now.
+  `using-libasm`). It's since been reworked to integer/16.16 fixed-point
+  throughout (`Vec2`/`Dir2` in `h/geometry`) so the module never touches the
+  FPU. This compiler has no native 64-bit integer type at all (not even via
+  `stdint.h`), which shaped the approach: `muldiv()` (`Asm/muldiv.h`, from
+  libAsm - link `${ASMLIB}`/`${ASMLIB_ZM}`) handles every "multiply two
+  32-bit values, then divide by a third"; a sum of two large products (eg a
+  cross product) is restructured so each product is divided back down to a
+  normal scale *before* combining; and the one genuine 64-bit need (isqrt of
+  a sum of two squares, for vector/mitre/dash-segment length) uses a small
+  self-contained 64-bit emulation in `c/geometry` (16-bit partial-product
+  multiply, carry-aware add/sub) rather than pulling in the environment's
+  own LongLong library for one function. See `c/geometry`'s file comment for
+  the full reasoning, and the "Cap and Join Specification" section of
+  `draw.xml` for why 16.16 is the natural scale (it's what
+  `Draw_LineStyle.mitre_limit` already uses).
+* **SWI wiring.** `Draw_ProcessPath` (buffer-output modes only),
+  `Draw_Fill`, `Draw_Stroke`, `Draw_StrokePath`, `Draw_FlattenPath` and
+  `Draw_TransformPath` are implemented. Multi-stage SWIs share
+  `run_pipeline()` (`c/module`), which `malloc()`s a fresh scratch buffer
+  per stage and frees the previous one as soon as it's consumed - SVC-mode
+  module code can't safely use large stack arrays the way `c/test` used
+  static globals, so each intermediate buffer is heap-allocated instead,
+  sized generously relative to its input (`scratch_alloc()`) rather than
+  predicted exactly. `deliver_path()` then either copies the final result
+  into the caller's buffer or reports its required size, and reports
+  `Error_DrawPathFull` on any allocation failure or overflow anywhere in the
+  chain. `Draw_Fill`/`Draw_Stroke` render to the VDU via a small
+  `Fill_Render` backed by `OS_Plot` (`module_hline()`/`module_polyhline()`
+  in `c/module`) - this is also where Draw's internal units (`Draw_OSUnit` =
+  256 per OS unit) get converted down to the OS units `OS_Plot` expects,
+  since every pipeline stage (including `transform()`) leaves coordinates in
+  internal units throughout.
+* **Known gaps, left out of scope for this pass:**
+  - `Draw_FillClipped`/`Draw_StrokeClipped` (RISC OS 5+, clip descriptors)
+    and the FP-vector SWI slots (`Draw_1`, `Draw_3`, ... - the unnamed
+    odd-numbered entries in the swi-decoding-table, auto-handled by CMHG)
+    report `err_DrawUnimplementedDraw`/`error_BAD_SWI` respectively.
+  - `Draw_ProcessPath`'s R7=1/2 (VDU output) are unsupported by design, per
+    the PRM itself ("This call is also unable to handle R7 = 1 or 2");
+    R7=&80000000+ptr (bounding box output) and R7=0 (write back in place)
+    are gaps, not PRM-documented exclusions - both report
+    `err_DrawUnimplementedDraw`.
+  - "Close open subpaths" (fill style bit 27) isn't implemented as a
+    distinct pass. `fill()` already closes every subpath implicitly for
+    winding purposes, which covers the common case, but nothing physically
+    inserts a closing element for other output modes.
+  - The "DrawV" vector-claiming mechanism (`DrawV_Reason` in `h/types`, for
+    printer drivers etc. to intercept Draw calls) is entirely out of scope.
+  - Fill style bits 2-5 (boundary-pixel control) aren't honoured by
+    `fill()` - only the winding-rule bits (0-1) are. This also means the
+    documented difference between fill style `&30` and `&18` (Draw_Stroke's
+    default when R4=0, meant to select boundary-only plotting for a
+    zero-width path) has no effect here; hairline stroke width instead
+    falls back to `DRAW_HAIRLINE_THICKNESS`, a small nonzero thickness, so
+    something visible is still produced.
+  - `Draw_TransformPath`'s R1=0 buffer (and every other stage's scratch
+    buffer) is sized by a fixed multiplier of the input's byte size
+    (`SCRATCH_MULTIPLIER`/`SCRATCH_MINIMUM` in `c/module`), not calculated
+    exactly - pathologically point-dense paths could in principle still
+    overflow it and report `Error_DrawPathFull` where a real Draw module
+    would succeed.
 
 ## Building, running, testing
 
