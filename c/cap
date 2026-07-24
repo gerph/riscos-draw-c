@@ -5,37 +5,54 @@
  * Author:      Gerph
  ******************************************************************/
 
-#include <math.h>
 #include <stddef.h>
 
 #include "cap.h"
 #include "cap_internal.h"
 #include "thicken.h"
 #include "thicken_internal.h"
+#include "geometry.h"
 #include "pathio.h"
+#include "Asm/muldiv.h"
+
+/* cos/sin of i*PI/8 for i=1..7, as 16.16 fixed-point (65536 = 1.0) -
+ * precomputed since the round cap fan only ever sweeps this one fixed set
+ * of angles (a semicircle in 8 equal steps), so there is no need for a
+ * general run-time trig function (which modules shouldn't use anyway - see
+ * AGENTS.md's "modules can't casually use floating point" caveat). */
+static const int32_t CAP_ROUND_COS[7] = { 60547, 46341, 25080, 0, -25080, -46341, -60547 };
+static const int32_t CAP_ROUND_SIN[7] = { 25080, 46341, 60547, 65536, 60547, 46341, 25080 };
 
 void cap_emit(bufferdata_t *buf,
-              Vec2 from, Vec2 to, Vec2 P, Vec2 perp, Vec2 dir,
-              double half_thick, Draw_CapStyle style,
+              Vec2 from, Vec2 to, Vec2 P, Dir2 perp, Dir2 dir,
+              int32_t half_thick, Draw_CapStyle style,
               int32_t width_256, int32_t length_256)
 {
-    double line_width = half_thick * 2.0;
-
     switch (style)
     {
         case Draw_CapRound:
         {
             /* Semicircle from 'from', through the outward bulge, to 'to' -
              * approximated with a handful of flat segments, matching the
-             * rest of this project's flatten-early approach. */
-            const int32_t STEPS = 8;
+             * rest of this project's flatten-early approach. Each point is
+             * half_thick*(perp*cos + dir*sin); px/py and qx/qy are
+             * half_thick*perp/F and half_thick*dir/F (computed once, since
+             * they don't depend on the angle), leaving one more muldiv per
+             * coordinate per step to bring in cos/sin - this way no
+             * individual product ever needs more than 32-bit-safe
+             * muldiv() handling (see the file comment in c.geometry). */
+            int32_t px = muldiv(half_thick, perp.x, GEOMETRY_FIXED_ONE);
+            int32_t py = muldiv(half_thick, perp.y, GEOMETRY_FIXED_ONE);
+            int32_t qx = muldiv(half_thick, dir.x, GEOMETRY_FIXED_ONE);
+            int32_t qy = muldiv(half_thick, dir.y, GEOMETRY_FIXED_ONE);
             int32_t i;
-            for (i = 1; i < STEPS; i++)
+            for (i = 0; i < 7; i++)
             {
-                double t = 3.14159265358979323846 * (double)i / (double)STEPS;
                 Vec2 p;
-                p.x = P.x + half_thick * (perp.x * cos(t) + dir.x * sin(t));
-                p.y = P.y + half_thick * (perp.y * cos(t) + dir.y * sin(t));
+                p.x = P.x + muldiv(px, CAP_ROUND_COS[i], GEOMETRY_FIXED_ONE)
+                          + muldiv(qx, CAP_ROUND_SIN[i], GEOMETRY_FIXED_ONE);
+                p.y = P.y + muldiv(py, CAP_ROUND_COS[i], GEOMETRY_FIXED_ONE)
+                          + muldiv(qy, CAP_ROUND_SIN[i], GEOMETRY_FIXED_ONE);
                 path_write_lineto(buf, vec_to_coord(p));
             }
             break;
@@ -47,10 +64,12 @@ void cap_emit(bufferdata_t *buf,
              * flat cap that stands proud of the endpoint rather than
              * sitting flush with it. */
             Vec2 p1, p2;
-            p1.x = from.x + dir.x * half_thick;
-            p1.y = from.y + dir.y * half_thick;
-            p2.x = to.x   + dir.x * half_thick;
-            p2.y = to.y   + dir.y * half_thick;
+            int32_t dx = muldiv(half_thick, dir.x, GEOMETRY_FIXED_ONE);
+            int32_t dy = muldiv(half_thick, dir.y, GEOMETRY_FIXED_ONE);
+            p1.x = from.x + dx;
+            p1.y = from.y + dy;
+            p2.x = to.x   + dx;
+            p2.y = to.y   + dy;
             path_write_lineto(buf, vec_to_coord(p1));
             path_write_lineto(buf, vec_to_coord(p2));
             break;
@@ -62,14 +81,17 @@ void cap_emit(bufferdata_t *buf,
              * apex stands away from the line both independently settable,
              * as fractions of the line width. */
             Vec2 base1, apex, base2;
-            double w = line_width * ((double)width_256 / 256.0);
-            double l = line_width * ((double)length_256 / 256.0);
-            base1.x = P.x + perp.x * w;
-            base1.y = P.y + perp.y * w;
-            apex.x  = P.x + dir.x * l;
-            apex.y  = P.y + dir.y * l;
-            base2.x = P.x - perp.x * w;
-            base2.y = P.y - perp.y * w;
+            int32_t line_width = half_thick * 2;
+            int32_t w = muldiv(line_width, width_256, 256);
+            int32_t l = muldiv(line_width, length_256, 256);
+            int32_t perp_w_x = muldiv(perp.x, w, GEOMETRY_FIXED_ONE);
+            int32_t perp_w_y = muldiv(perp.y, w, GEOMETRY_FIXED_ONE);
+            base1.x = P.x + perp_w_x;
+            base1.y = P.y + perp_w_y;
+            apex.x  = P.x + muldiv(dir.x, l, GEOMETRY_FIXED_ONE);
+            apex.y  = P.y + muldiv(dir.y, l, GEOMETRY_FIXED_ONE);
+            base2.x = P.x - perp_w_x;
+            base2.y = P.y - perp_w_y;
             path_write_lineto(buf, vec_to_coord(base1));
             path_write_lineto(buf, vec_to_coord(apex));
             path_write_lineto(buf, vec_to_coord(base2));
@@ -88,7 +110,7 @@ int32_t cap(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickne
             Draw_LineStyle *style)
 {
     bufferdata_t buf;
-    double half_thick = thickness / 2.0;
+    int32_t half_thick = thickness / 2;
 
     if (style == NULL)
         return thicken(inpath, outpath, thickness);
@@ -107,7 +129,7 @@ int32_t cap(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickne
 
         inpath = thicken_read_gapped_subpath(inpath, &gp);
 
-        if (half_thick > 0.0)
+        if (half_thick > 0)
             thicken_process_gapped(&gp, half_thick, style, &buf);
     }
 

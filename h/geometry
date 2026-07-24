@@ -1,9 +1,11 @@
 /*******************************************************************
  * File:     geometry
  * Purpose:  Small 2D vector helpers shared by the thickening, capping and
- *           dashing stages
+ *           dashing stages - integer/fixed-point only, no floating point,
+ *           since this is shared with the Draw module itself (see
+ *           writing-cmodules: modules must not use FP without fpsvc)
  * Author:   Gerph
- * Date:     23 Jul 2026
+ * Date:     24 Jul 2026
  ******************************************************************/
 
 #ifndef GEOMETRY_H
@@ -11,9 +13,33 @@
 
 #include "types.h"
 
+/* A point, in the same units as the path itself (Draw's internal units -
+ * 1/256 OS unit). Deliberately the same layout as OS_Coord; kept as a
+ * distinct type so call sites read as "processed geometry" rather than
+ * "raw path data".
+ */
 typedef struct {
-    double x, y;
+    int32_t x, y;
 } Vec2;
+
+/* A unit direction vector, as a 16.16 fixed-point fraction (65536 = 1.0) -
+ * the same scale Draw itself uses for Draw_LineStyle's mitre_limit field
+ * (see the Cap and Join Specification in draw.xml), so this isn't an
+ * arbitrary choice of scale.
+ */
+typedef struct {
+    int32_t x, y;
+} Dir2;
+
+#define GEOMETRY_FIXED_SHIFT (16)
+#define GEOMETRY_FIXED_ONE   ((int32_t)1 << GEOMETRY_FIXED_SHIFT)
+
+/* Other pipeline stages needing their own "multiply two 32-bit values,
+ * then divide by a third" fixed-point arithmetic (eg thicken's mitre-point
+ * formula, cap's round-cap geometry) should use muldiv() (Asm/muldiv.h,
+ * from libAsm) directly, the same way c.geometry does - see the file
+ * comment in c.geometry for why (no native 64-bit integer type here).
+ */
 
 /*************************************************** Gerph *********
  Function:      coord_to_vec
@@ -25,24 +51,35 @@ Vec2 coord_to_vec(OS_Coord p);
 
 /*************************************************** Gerph *********
  Function:      vec_to_coord
- Description:   Convert a Vec2 back to an integer Draw coordinate, rounding
-                to the nearest whole unit
+ Description:   Convert a Vec2 back to an integer Draw coordinate
  Parameters:    v = the vector to convert
  Returns:       the equivalent OS_Coord
  ******************************************************************/
 OS_Coord vec_to_coord(Vec2 v);
 
 /*************************************************** Gerph *********
+ Function:      vec_distance
+ Description:   Integer distance between two points, rounded to the
+                nearest whole unit. Used both for mitre length (thicken)
+                and segment length (dash) - the sole user of isqrt64() in
+                this file
+ Parameters:    a, b = the two points
+ Returns:       distance between a and b, rounded
+ ******************************************************************/
+int32_t vec_distance(Vec2 a, Vec2 b);
+
+/*************************************************** Gerph *********
  Function:      unit_dir
- Description:   Calculate the unit direction vector from a to b. Zero-length
-                segments (a degenerate, duplicated point) are given an
-                arbitrary direction rather than dividing by zero; callers
-                tolerate this since such segments contribute nothing visible.
+ Description:   Calculate the unit direction vector from a to b, as a
+                16.16 fixed-point fraction. Zero-length segments (a
+                degenerate, duplicated point) are given an arbitrary
+                direction rather than dividing by zero; callers tolerate
+                this since such segments contribute nothing visible.
  Parameters:    a = the point the segment starts at
                 b = the point the segment ends at
- Returns:       unit vector pointing from a to b
+ Returns:       unit vector pointing from a to b, 16.16 fixed
  ******************************************************************/
-Vec2 unit_dir(OS_Coord a, OS_Coord b);
+Dir2 unit_dir(OS_Coord a, OS_Coord b);
 
 /*************************************************** Gerph *********
  Function:      offset_point
@@ -50,11 +87,11 @@ Vec2 unit_dir(OS_Coord a, OS_Coord b);
                 perpendicular to unit direction dir
  Parameters:    V = the point to offset from
                 dir = unit direction the line is travelling in at V
-                side_sign = +1.0 to offset to the left of dir, -1.0 to the
+                side_sign = +1 to offset to the left of dir, -1 to the
                             right
-                half_thick = distance to offset by
+                half_thick = distance to offset by, in path units
  Returns:       the offset point
  ******************************************************************/
-Vec2 offset_point(Vec2 V, Vec2 dir, double side_sign, double half_thick);
+Vec2 offset_point(Vec2 V, Dir2 dir, int32_t side_sign, int32_t half_thick);
 
 #endif

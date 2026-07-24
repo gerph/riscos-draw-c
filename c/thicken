@@ -6,7 +6,6 @@
  ******************************************************************/
 
 #include <string.h>
-#include <math.h>
 #include <stddef.h>
 
 #include "thicken.h"
@@ -14,10 +13,24 @@
 #include "cap_internal.h"
 #include "geometry.h"
 #include "pathio.h"
+#include "Asm/muldiv.h"
 
 /* Ratio of mitre length to line width beyond which a corner is bevelled
- * instead of mitred, matching the sense of Draw_LineStyle's mitre_limit. */
-#define THICKEN_MITRE_LIMIT (4.0)
+ * instead of mitred, matching the sense of Draw_LineStyle's mitre_limit -
+ * and using the same 16.16 fixed-point scale as that field. */
+#define THICKEN_MITRE_LIMIT ((int32_t)(4 << GEOMETRY_FIXED_SHIFT))
+
+/* Below this magnitude, dir_in x dir_out (both 16.16 fixed unit vectors,
+ * each product divided back down to 16.16 scale by muldiv() before being
+ * combined - see join_points() - so this cross product is 16.16 fixed
+ * too) is treated as exactly parallel or antiparallel rather than risking
+ * a division by a near-zero cross product. */
+#define THICKEN_PARALLEL_THRESHOLD (2)
+
+static int32_t iabs32(int32_t v)
+{
+    return v < 0 ? -v : v;
+}
 
 /* Compute the offset outline point(s) needed at a vertex V where the path
  * turns from unit direction dir_in to dir_out, on one side of the line
@@ -25,19 +38,28 @@
  * run or a mitre join within the limit, or 2 points for a bevelled join
  * (including the degenerate cusp where the path doubles back on itself).
  * Returns the number of points written.
+ *
+ * cross/dot/t are all computed via muldiv() (a*b/c with a 64-bit
+ * intermediate, since this compiler has no native 64-bit integer type) -
+ * each individual product is divided back down to a normal 32-bit-safe
+ * scale immediately, rather than ever holding a raw Dir2*Dir2 product
+ * (which can be up to 2^32) or diff*Dir2 product (which can be larger
+ * still) unshrunk.
  */
-static int join_points(Vec2 V, Vec2 dir_in, Vec2 dir_out,
-                        double side_sign, double half_thick, double mitre_limit,
+static int join_points(Vec2 V, Dir2 dir_in, Dir2 dir_out,
+                        int32_t side_sign, int32_t half_thick, int32_t mitre_limit,
                         Vec2 *out)
 {
     Vec2 p_in  = offset_point(V, dir_in,  side_sign, half_thick);
     Vec2 p_out = offset_point(V, dir_out, side_sign, half_thick);
-    double cross = dir_in.x * dir_out.y - dir_in.y * dir_out.x;
-    double dot   = dir_in.x * dir_out.x + dir_in.y * dir_out.y;
+    int32_t cross = muldiv(dir_in.x, dir_out.y, GEOMETRY_FIXED_ONE) -
+                     muldiv(dir_in.y, dir_out.x, GEOMETRY_FIXED_ONE);
+    int32_t dot   = muldiv(dir_in.x, dir_out.x, GEOMETRY_FIXED_ONE) +
+                     muldiv(dir_in.y, dir_out.y, GEOMETRY_FIXED_ONE);
 
-    if (fabs(cross) < 1e-6)
+    if (iabs32(cross) < THICKEN_PARALLEL_THRESHOLD)
     {
-        if (dot > 0.0)
+        if (dot > 0)
         {
             /* Directions unchanged: both offsets coincide */
             out[0] = p_out;
@@ -52,19 +74,25 @@ static int join_points(Vec2 V, Vec2 dir_in, Vec2 dir_out,
 
     {
         Vec2 diff;
-        double t;
+        int32_t t;
         Vec2 mitre;
-        double mitre_length;
+        int32_t mitre_length;
+        int32_t threshold;
 
         diff.x = p_out.x - p_in.x;
         diff.y = p_out.y - p_in.y;
-        t = (diff.x * dir_out.y - diff.y * dir_out.x) / cross;
-        mitre.x = p_in.x + t * dir_in.x;
-        mitre.y = p_in.y + t * dir_in.y;
-        mitre_length = sqrt((mitre.x - V.x) * (mitre.x - V.x) +
-                             (mitre.y - V.y) * (mitre.y - V.y));
+        /* t = (diff x dir_out) / cross - the F scaling built into diff x
+         * dir_out and into cross (both computed the same way) cancels, so
+         * no further rescaling is needed here. */
+        t = muldiv(diff.x, dir_out.y, cross) - muldiv(diff.y, dir_out.x, cross);
+        mitre.x = p_in.x + muldiv(t, dir_in.x, GEOMETRY_FIXED_ONE);
+        mitre.y = p_in.y + muldiv(t, dir_in.y, GEOMETRY_FIXED_ONE);
+        mitre_length = vec_distance(mitre, V);
 
-        if (mitre_length <= mitre_limit * 2.0 * half_thick)
+        /* mitre_length <= mitre_limit * 2 * half_thick (mitre_limit is
+         * 16.16 fixed). */
+        threshold = muldiv(mitre_limit, 2 * half_thick, GEOMETRY_FIXED_ONE);
+        if (mitre_length <= threshold)
         {
             out[0] = mitre;
             return 1;
@@ -82,7 +110,7 @@ static int join_points(Vec2 V, Vec2 dir_in, Vec2 dir_out,
  * interior vertices are joined with join_points(). out[] must have room for
  * up to 2 points per vertex.
  */
-static int32_t side_offset_open(Subpath *sp, double side_sign, double half_thick, Vec2 *out)
+static int32_t side_offset_open(Subpath *sp, int32_t side_sign, int32_t half_thick, Vec2 *out)
 {
     int32_t n = sp->count;
     int32_t m = 0;
@@ -94,18 +122,18 @@ static int32_t side_offset_open(Subpath *sp, double side_sign, double half_thick
 
         if (i == 0)
         {
-            Vec2 dir = unit_dir(sp->pts[0], sp->pts[1]);
+            Dir2 dir = unit_dir(sp->pts[0], sp->pts[1]);
             out[m++] = offset_point(V, dir, side_sign, half_thick);
         }
         else if (i == n - 1)
         {
-            Vec2 dir = unit_dir(sp->pts[n - 2], sp->pts[n - 1]);
+            Dir2 dir = unit_dir(sp->pts[n - 2], sp->pts[n - 1]);
             out[m++] = offset_point(V, dir, side_sign, half_thick);
         }
         else
         {
-            Vec2 dir_in  = unit_dir(sp->pts[i - 1], sp->pts[i]);
-            Vec2 dir_out = unit_dir(sp->pts[i], sp->pts[i + 1]);
+            Dir2 dir_in  = unit_dir(sp->pts[i - 1], sp->pts[i]);
+            Dir2 dir_out = unit_dir(sp->pts[i], sp->pts[i + 1]);
             Vec2 joined[2];
             int32_t c = join_points(V, dir_in, dir_out, side_sign, half_thick,
                                      THICKEN_MITRE_LIMIT, joined);
@@ -121,7 +149,7 @@ static int32_t side_offset_open(Subpath *sp, double side_sign, double half_thick
 /* As side_offset_open, but every vertex wraps around to its neighbours -
  * there are no flush ends, since a closed subpath has no loose ends.
  */
-static int32_t side_offset_closed(Subpath *sp, double side_sign, double half_thick, Vec2 *out)
+static int32_t side_offset_closed(Subpath *sp, int32_t side_sign, int32_t half_thick, Vec2 *out)
 {
     int32_t n = sp->count;
     int32_t m = 0;
@@ -130,8 +158,8 @@ static int32_t side_offset_closed(Subpath *sp, double side_sign, double half_thi
     for (i = 0; i < n; i++)
     {
         Vec2 V = coord_to_vec(sp->pts[i]);
-        Vec2 dir_in  = unit_dir(sp->pts[(i - 1 + n) % n], sp->pts[i]);
-        Vec2 dir_out = unit_dir(sp->pts[i], sp->pts[(i + 1) % n]);
+        Dir2 dir_in  = unit_dir(sp->pts[(i - 1 + n) % n], sp->pts[i]);
+        Dir2 dir_out = unit_dir(sp->pts[i], sp->pts[(i + 1) % n]);
         Vec2 joined[2];
         int32_t c = join_points(V, dir_in, dir_out, side_sign, half_thick,
                                  THICKEN_MITRE_LIMIT, joined);
@@ -150,13 +178,13 @@ static int32_t side_offset_closed(Subpath *sp, double side_sign, double half_thi
  * is NULL, which is what thicken() below always passes; cap() passes a
  * real style to get round/square/triangular caps instead.
  */
-static void thicken_emit_open(Subpath *sp, double half_thick,
+static void thicken_emit_open(Subpath *sp, int32_t half_thick,
                                Draw_LineStyle *style, bufferdata_t *buf)
 {
     Vec2 left[2 * PATH_MAX_POINTS];
     Vec2 right[2 * PATH_MAX_POINTS];
-    int32_t nl = side_offset_open(sp, 1.0, half_thick, left);
-    int32_t nr = side_offset_open(sp, -1.0, half_thick, right);
+    int32_t nl = side_offset_open(sp, 1, half_thick, left);
+    int32_t nr = side_offset_open(sp, -1, half_thick, right);
     int32_t i;
 
     if (nl < 1 || nr < 1)
@@ -171,8 +199,8 @@ static void thicken_emit_open(Subpath *sp, double half_thick,
         /* End cap: the line was travelling in this direction when it
          * reached its last point, and the cap projects further that way. */
         Vec2 P = coord_to_vec(sp->pts[sp->count - 1]);
-        Vec2 dir = unit_dir(sp->pts[sp->count - 2], sp->pts[sp->count - 1]);
-        Vec2 perp;
+        Dir2 dir = unit_dir(sp->pts[sp->count - 2], sp->pts[sp->count - 1]);
+        Dir2 perp;
         perp.x = -dir.y;
         perp.y = dir.x;
         cap_emit(buf, left[nl - 1], right[nr - 1], P, perp, dir,
@@ -190,8 +218,8 @@ static void thicken_emit_open(Subpath *sp, double half_thick,
         /* Start cap: projects backwards, away from the direction the line
          * heads off in from its first point. */
         Vec2 P = coord_to_vec(sp->pts[0]);
-        Vec2 dir = unit_dir(sp->pts[0], sp->pts[1]);
-        Vec2 perp, out_dir;
+        Dir2 dir = unit_dir(sp->pts[0], sp->pts[1]);
+        Dir2 perp, out_dir;
         perp.x = dir.y;
         perp.y = -dir.x;
         out_dir.x = -dir.x;
@@ -207,12 +235,12 @@ static void thicken_emit_open(Subpath *sp, double half_thick,
 /* Emit a closed subpath as two closed rings, wound in opposite directions
  * so a nonzero winding rule fills the band between them.
  */
-static void thicken_emit_closed(Subpath *sp, double half_thick, bufferdata_t *buf)
+static void thicken_emit_closed(Subpath *sp, int32_t half_thick, bufferdata_t *buf)
 {
     Vec2 left[2 * PATH_MAX_POINTS];
     Vec2 right[2 * PATH_MAX_POINTS];
-    int32_t nl = side_offset_closed(sp, 1.0, half_thick, left);
-    int32_t nr = side_offset_closed(sp, -1.0, half_thick, right);
+    int32_t nl = side_offset_closed(sp, 1, half_thick, left);
+    int32_t nr = side_offset_closed(sp, -1, half_thick, right);
     int32_t i;
 
     if (nl >= 3)
@@ -271,7 +299,7 @@ Draw_PathElement *thicken_read_gapped_subpath(Draw_PathElement *inpath, GappedPa
     return inpath;
 }
 
-void thicken_process_gapped(GappedPath *gp, double half_thick,
+void thicken_process_gapped(GappedPath *gp, int32_t half_thick,
                              Draw_LineStyle *style, bufferdata_t *buf)
 {
     int32_t n = gp->count;
@@ -327,7 +355,7 @@ void thicken_process_gapped(GappedPath *gp, double half_thick,
 int32_t thicken(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thickness)
 {
     bufferdata_t buf;
-    double half_thick = thickness / 2.0;
+    int32_t half_thick = thickness / 2;
 
     path_writer_init(&buf, outpath);
 
@@ -344,7 +372,7 @@ int32_t thicken(Draw_PathElement *inpath, Draw_PathElement *outpath, int32_t thi
 
         inpath = thicken_read_gapped_subpath(inpath, &gp);
 
-        if (half_thick > 0.0)
+        if (half_thick > 0)
             thicken_process_gapped(&gp, half_thick, NULL, &buf);
     }
 

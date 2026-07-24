@@ -9,6 +9,8 @@
 
 #include "fill.h"
 #include "pathio.h"
+#include "geometry.h"
+#include "Asm/muldiv.h"
 
 /* Maximum edge crossings tracked for a single scanline. A crossing is
  * produced by every non-horizontal edge (including each subpath's implicit
@@ -18,15 +20,9 @@
 #define FILL_MAX_CROSSINGS (128)
 
 typedef struct {
-    double  x;
+    int32_t x;
     int32_t winding;   /* +1 if the edge ran from lower y to higher y, else -1 */
 } Fill_Crossing;
-
-/* Round a double to the nearest int32_t, away from zero on a tie. */
-static int32_t fill_round32(double v)
-{
-    return (int32_t)((v < 0.0) ? (v - 0.5) : (v + 0.5));
-}
 
 /* Decide whether a winding number counts as "inside" under fill_style's
  * winding rule (the low 2 bits - see Draw_FillNonzero/Negative/EvenOdd/
@@ -57,7 +53,7 @@ static void fill_test_edge(OS_Coord a, OS_Coord b, int32_t y,
                             int32_t max, int *overflowed)
 {
     int32_t ymin, ymax;
-    double x;
+    int32_t x;
 
     if (a.y == b.y)
         return;
@@ -68,8 +64,7 @@ static void fill_test_edge(OS_Coord a, OS_Coord b, int32_t y,
     if (y < ymin || y >= ymax)
         return;
 
-    x = (double)a.x +
-        ((double)y - (double)a.y) * ((double)b.x - (double)a.x) / ((double)b.y - (double)a.y);
+    x = a.x + muldiv(y - a.y, b.x - a.x, b.y - a.y);
 
     if (*count >= max)
     {
@@ -257,7 +252,7 @@ int32_t fill(Draw_PathElement *inpath, Draw_FillStyle fill_style, int32_t step, 
 
             if (!inside_before && inside_after)
             {
-                span_start = fill_round32(crossings[i].x);
+                span_start = crossings[i].x;
                 in_span = 1;
             }
             else if (inside_before && !inside_after && in_span)
@@ -266,7 +261,7 @@ int32_t fill(Draw_PathElement *inpath, Draw_FillStyle fill_style, int32_t step, 
                 {
                     spans[nspans].x0 = span_start;
                     spans[nspans].y = y;
-                    spans[nspans].x1 = fill_round32(crossings[i].x);
+                    spans[nspans].x1 = crossings[i].x;
                     nspans++;
                 }
                 in_span = 0;

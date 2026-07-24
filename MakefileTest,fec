@@ -35,7 +35,9 @@ INCLUDES   =
 CDEFINES   =
 
 # Space separated list of libraries to link against, eg C:LibName.o.libLibName
-LIBS       = ${CLIB}
+# ASMLIB provides muldiv(), used throughout the pipeline stages for
+# fixed-point arithmetic (this compiler has no native 64-bit integer type).
+LIBS       = ${CLIB} ${ASMLIB}
 
 # Objects to build, using the format o.<name> (will be varied for build type).
 # The library objects (everything but o.test) are shared with the Draw

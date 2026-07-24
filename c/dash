@@ -5,19 +5,19 @@
  * Author:      Gerph
  ******************************************************************/
 
-#include <math.h>
 #include <stddef.h>
 
 #include "dash.h"
 #include "pathio.h"
 #include "geometry.h"
+#include "Asm/muldiv.h"
 
 typedef struct {
     const int32_t *elements;
     int32_t count;      /* 0 means "no usable pattern" - draw solid */
     int32_t index;      /* which element we are currently within */
     int32_t on;         /* is that element drawn ("on") or a gap? */
-    double  remaining;  /* distance left to travel within the current element */
+    int32_t remaining;  /* distance left to travel within the current element */
 } DashState;
 
 /* Skip forward over any non-positive elements (which have nothing to
@@ -32,7 +32,7 @@ static void dash_state_reset_element(DashState *ds)
         ds->index = (ds->index + 1) % ds->count;
         ds->on = !ds->on;
     }
-    ds->remaining = (double)ds->elements[ds->index];
+    ds->remaining = ds->elements[ds->index];
 }
 
 static void dash_state_advance(DashState *ds)
@@ -50,7 +50,7 @@ static void dash_state_advance(DashState *ds)
  */
 static void dash_state_init(DashState *ds, Draw_DashPattern *pattern)
 {
-    double phase;
+    int32_t phase;
     int32_t i;
     int32_t has_positive = 0;
 
@@ -58,7 +58,7 @@ static void dash_state_init(DashState *ds, Draw_DashPattern *pattern)
     ds->count = pattern->element_count;
     ds->index = 0;
     ds->on = 1;
-    ds->remaining = 0.0;
+    ds->remaining = 0;
 
     if (ds->count <= 0)
     {
@@ -82,13 +82,13 @@ static void dash_state_init(DashState *ds, Draw_DashPattern *pattern)
 
     dash_state_reset_element(ds);
 
-    phase = (double)pattern->start;
-    while (phase > 0.0)
+    phase = pattern->start;
+    while (phase > 0)
     {
         if (phase < ds->remaining)
         {
             ds->remaining -= phase;
-            phase = 0.0;
+            phase = 0;
         }
         else
         {
@@ -110,12 +110,12 @@ static void dash_walk(OS_Coord *points, int32_t n, DashState *ds, bufferdata_t *
     {
         Vec2 a = coord_to_vec(points[i]);
         Vec2 b = coord_to_vec(points[i + 1]);
-        double seg_len = sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y));
-        double seg_pos = 0.0;
+        int32_t seg_len = vec_distance(a, b);
+        int32_t seg_pos = 0;
 
         while (seg_pos < seg_len)
         {
-            double step = ds->remaining;
+            int32_t step = ds->remaining;
             Vec2 p;
 
             if (step > seg_len - seg_pos)
@@ -123,15 +123,15 @@ static void dash_walk(OS_Coord *points, int32_t n, DashState *ds, bufferdata_t *
             seg_pos += step;
             ds->remaining -= step;
 
-            p.x = a.x + (b.x - a.x) * (seg_pos / seg_len);
-            p.y = a.y + (b.y - a.y) * (seg_pos / seg_len);
+            p.x = a.x + muldiv(b.x - a.x, seg_pos, seg_len);
+            p.y = a.y + muldiv(b.y - a.y, seg_pos, seg_len);
 
             if (ds->on)
                 path_write_lineto(buf, vec_to_coord(p));
             else
                 path_write_gapto(buf, vec_to_coord(p));
 
-            if (ds->remaining <= 1e-6)
+            if (ds->remaining <= 0)
                 dash_state_advance(ds);
         }
     }

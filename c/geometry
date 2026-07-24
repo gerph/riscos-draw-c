@@ -1,61 +1,182 @@
 /*******************************************************************
  * File:        geometry
  * Purpose:     Small 2D vector helpers shared by the thickening, capping
- *              and dashing stages
+ *              and dashing stages - integer/fixed-point only, no floating
+ *              point (see h.geometry). This compiler has no 64-bit integer
+ *              type at all (not even via stdint.h), so:
+ *               - every "multiply two 32-bit values, then divide by a
+ *                 third" is done with muldiv() (Asm/muldiv.h, from
+ *                 libAsm), which does the intermediate product at full
+ *                 64-bit precision internally without needing a 64-bit
+ *                 type in our own code;
+ *               - the one place that can't be expressed as a single
+ *                 multiply-then-divide - summing two squares for an
+ *                 integer square root - uses a small self-contained
+ *                 64-bit emulation (mul32_64/add64/sub64 below), built the
+ *                 same way the environment's own LongLong library does
+ *                 (16-bit partial products), rather than pulling in that
+ *                 whole library for one function.
  * Author:      Gerph
  ******************************************************************/
 
-#include <math.h>
-
 #include "geometry.h"
+#include "Asm/muldiv.h"
+
+/* Unsigned 32x32->64 multiply via 16-bit partial products. */
+static void mul32_64(uint32_t a, uint32_t b, uint32_t *hi, uint32_t *lo)
+{
+    uint32_t a0 = a & 0xFFFFu, a1 = a >> 16;
+    uint32_t b0 = b & 0xFFFFu, b1 = b >> 16;
+    uint32_t p0 = a0 * b0;
+    uint32_t p1 = a0 * b1;
+    uint32_t p2 = a1 * b0;
+    uint32_t p3 = a1 * b1;
+    uint32_t mid = p1 + p2;
+    uint32_t mid_carry = (mid < p1) ? 0x10000u : 0u;
+    uint32_t lo_val = p0 + (mid << 16);
+    uint32_t lo_carry = (lo_val < p0) ? 1u : 0u;
+
+    *lo = lo_val;
+    *hi = p3 + (mid >> 16) + mid_carry + lo_carry;
+}
+
+static void add64(uint32_t ah, uint32_t al, uint32_t bh, uint32_t bl, uint32_t *rh, uint32_t *rl)
+{
+    uint32_t lo = al + bl;
+    *rl = lo;
+    *rh = ah + bh + ((lo < al) ? 1u : 0u);
+}
+
+static void sub64(uint32_t ah, uint32_t al, uint32_t bh, uint32_t bl, uint32_t *rh, uint32_t *rl)
+{
+    uint32_t borrow = (al < bl) ? 1u : 0u;
+    *rl = al - bl;
+    *rh = ah - bh - borrow;
+}
+
+static int gt64(uint32_t ah, uint32_t al, uint32_t bh, uint32_t bl)
+{
+    if (ah != bh)
+        return ah > bh;
+    return al > bl;
+}
+
+static int ge64(uint32_t ah, uint32_t al, uint32_t bh, uint32_t bl)
+{
+    if (ah != bh)
+        return ah > bh;
+    return al >= bl;
+}
+
+/* Integer square root of a 64-bit value held as (hi,lo) 32-bit halves,
+ * rounded to the nearest whole result - the classic binary-search/"digit
+ * by digit" method, needing only shifts, compares, adds and subtracts.
+ */
+static int32_t isqrt64(uint32_t xh, uint32_t xl)
+{
+    uint32_t resh = 0, resl = 0;
+    uint32_t bith = ((uint32_t)1) << 30; /* 1<<62, as a (hi,lo) pair */
+    uint32_t bitl = 0;
+
+    while (gt64(bith, bitl, xh, xl))
+    {
+        bitl = (bitl >> 2) | (bith << 30);
+        bith = bith >> 2;
+    }
+
+    while (bith != 0 || bitl != 0)
+    {
+        uint32_t th, tl;
+        add64(resh, resl, bith, bitl, &th, &tl);
+
+        resl = (resl >> 1) | (resh << 31);
+        resh = resh >> 1;
+
+        if (ge64(xh, xl, th, tl))
+        {
+            sub64(xh, xl, th, tl, &xh, &xl);
+            add64(resh, resl, bith, bitl, &resh, &resl);
+        }
+
+        bitl = (bitl >> 2) | (bith << 30);
+        bith = bith >> 2;
+    }
+
+    /* resh is always 0 here: the sum of two squares of 32-bit deltas fits
+     * in 64 bits, so its square root always fits in 32. x (mutated above)
+     * now holds the remainder - round up if it puts the true value closer
+     * to res+1 than to res. */
+    if (gt64(xh, xl, 0, resl))
+        resl++;
+
+    return (int32_t)resl;
+}
+
+/* Integer distance between two points via isqrt64 of the sum of two
+ * squares, computed with mul32_64/add64 rather than a native 64-bit type.
+ */
+static int32_t distance_int(int32_t dx, int32_t dy)
+{
+    uint32_t mdx = (uint32_t)(dx < 0 ? -dx : dx);
+    uint32_t mdy = (uint32_t)(dy < 0 ? -dy : dy);
+    uint32_t h1, l1, h2, l2, sh, sl;
+
+    mul32_64(mdx, mdx, &h1, &l1);
+    mul32_64(mdy, mdy, &h2, &l2);
+    add64(h1, l1, h2, l2, &sh, &sl);
+
+    return isqrt64(sh, sl);
+}
 
 Vec2 coord_to_vec(OS_Coord p)
 {
     Vec2 v;
-    v.x = (double)p.x;
-    v.y = (double)p.y;
+    v.x = p.x;
+    v.y = p.y;
     return v;
-}
-
-static int32_t round_to_int32(double v)
-{
-    return (int32_t)(v >= 0.0 ? v + 0.5 : v - 0.5);
 }
 
 OS_Coord vec_to_coord(Vec2 v)
 {
     OS_Coord p;
-    p.x = round_to_int32(v.x);
-    p.y = round_to_int32(v.y);
+    p.x = v.x;
+    p.y = v.y;
     return p;
 }
 
-Vec2 unit_dir(OS_Coord a, OS_Coord b)
+int32_t vec_distance(Vec2 a, Vec2 b)
 {
-    double dx = (double)b.x - (double)a.x;
-    double dy = (double)b.y - (double)a.y;
-    double len = sqrt(dx * dx + dy * dy);
-    Vec2 v;
-
-    if (len < 1e-9)
-    {
-        v.x = 1.0;
-        v.y = 0.0;
-        return v;
-    }
-
-    v.x = dx / len;
-    v.y = dy / len;
-    return v;
+    return distance_int(b.x - a.x, b.y - a.y);
 }
 
-Vec2 offset_point(Vec2 V, Vec2 dir, double side_sign, double half_thick)
+Dir2 unit_dir(OS_Coord a, OS_Coord b)
 {
-    Vec2 n;
+    int32_t dx = b.x - a.x;
+    int32_t dy = b.y - a.y;
+    int32_t len = distance_int(dx, dy);
+    Dir2 d;
+
+    if (len == 0)
+    {
+        d.x = GEOMETRY_FIXED_ONE;
+        d.y = 0;
+        return d;
+    }
+
+    d.x = muldiv(dx, GEOMETRY_FIXED_ONE, len);
+    d.y = muldiv(dy, GEOMETRY_FIXED_ONE, len);
+    return d;
+}
+
+Vec2 offset_point(Vec2 V, Dir2 dir, int32_t side_sign, int32_t half_thick)
+{
+    Dir2 n;
     Vec2 p;
+
     n.x = -dir.y;
     n.y = dir.x;
-    p.x = V.x + side_sign * half_thick * n.x;
-    p.y = V.y + side_sign * half_thick * n.y;
+
+    p.x = V.x + side_sign * muldiv(half_thick, n.x, GEOMETRY_FIXED_ONE);
+    p.y = V.y + side_sign * muldiv(half_thick, n.y, GEOMETRY_FIXED_ONE);
     return p;
 }

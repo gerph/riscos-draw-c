@@ -54,7 +54,7 @@ Draw_PathElement *thicken_read_gapped_subpath(Draw_PathElement *inpath, GappedPa
                 buf-> the path writer
  Returns:       none
  ******************************************************************/
-void thicken_process_gapped(GappedPath *gp, double half_thick,
+void thicken_process_gapped(GappedPath *gp, int32_t half_thick,
                              Draw_LineStyle *style, bufferdata_t *buf);
 
 #endif

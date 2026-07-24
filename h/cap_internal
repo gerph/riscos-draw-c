@@ -38,8 +38,8 @@
  Returns:       none
  ******************************************************************/
 void cap_emit(bufferdata_t *buf,
-              Vec2 from, Vec2 to, Vec2 P, Vec2 perp, Vec2 dir,
-              double half_thick, Draw_CapStyle style,
+              Vec2 from, Vec2 to, Vec2 P, Dir2 perp, Dir2 dir,
+              int32_t half_thick, Draw_CapStyle style,
               int32_t width_256, int32_t length_256);
 
 #endif

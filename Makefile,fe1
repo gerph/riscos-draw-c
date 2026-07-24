@@ -29,14 +29,29 @@ INCLUDES   =
 
 # Space separated list of libraries to link against, eg C:LibName.o.libLibName
 # (${CLIB} is implicit, unless NOCLIB = yes)
-LIBS       =
+# ASMLIB_ZM (position-independent/ROM-safe libAsm) provides muldiv(), used
+# throughout the pipeline stages for fixed-point arithmetic - this compiler
+# has no native 64-bit integer type, so a*b/c with a 64-bit intermediate
+# has to come from a library routine rather than an int64_t cast.
+LIBS       = ${ASMLIB_ZM}
 
 # Space separated list of defines to set, eg -DDEBUG
 CDEFINES   =
 
-# Objects to build, using the format o.<name> (will be varied for build type)
+# Objects to build, using the format o.<name> (will be varied for build type).
+# The pipeline objects (everything but o.module) are shared with c.test's
+# own build (see MakefileTest,fec) - they land in oz32 here and o32 there,
+# so the two builds never clash even though the sources are shared.
 OBJS       = 			 \
              o.module \
+             o.bufferdata \
+             o.geometry \
+             o.pathio \
+             o.flatten \
+             o.thicken \
+             o.cap \
+             o.dash \
+             o.fill \
 
 
 include CModule
