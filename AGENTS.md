@@ -1,12 +1,15 @@
-# DrawFlattening project notes
+# Draw module notes
 
-Standalone AIF command-line program that reimplements the core of the RISC
-OS Draw module's path-processing pipeline from scratch: flattening Bezier
-curves, dashing, thickening (stroke-to-fill), and line-end capping. It is a
-learning/exercise project, not a Draw module replacement - there is no
-`RMEnsure`, no SWI veneer, no CMHG. `main()` just builds a couple of test
-paths in memory and runs them through the pipeline, printing and plotting
-the result.
+This is a from-scratch reimplementation of the RISC OS Draw module,
+including its path-processing pipeline: flattening Bezier curves, dashing,
+thickening (stroke-to-fill), line-end capping, and scanline filling with all
+four Draw winding rules. The pipeline logic (`c/flatten`, `c/dash`,
+`c/thicken`, `c/cap`, `c/fill`, plus their shared helpers) started life as a
+standalone AIF test program under `flattening/` and has since been folded
+into the module's own `c/`/`h/` directories so `c/module`'s SWI veneers can
+call straight into it. `flattening/` now only holds reference material
+(`draw.xml`, `GOAL.md`, `thickening.md`) and old build output - the working
+source lives at the top level from here on.
 
 Branch `flattening-claude` off `master`; each pipeline stage was added in
 its own commit (see `git log --oneline`).
@@ -14,13 +17,23 @@ its own commit (see `git log --oneline`).
 ## Where things are
 
 ```
-h/types              Draw module data structures and constants (Draw_PathElement,
-                      Draw_Tag, Draw_CapStyle, Draw_JoinStyle, Draw_LineStyle,
-                      Draw_DashPattern, OS_Coord, ...)
-h/bufferdata          Third-party-style buffer writer with overflow tracking (see below)
-c/bufferdata
-h/global              Empty placeholder required by h/bufferdata's #include "global.h"
-                      (this project's per-project global header; nothing needed here yet)
+h/modhead                CMunge-generated module header (SWI numbers, error
+                          blocks, Mod_Init/Mod_Final/SWI_* prototypes) - do
+                          not hand-edit, it's regenerated from cmhg/modhead
+cmhg/modhead              CMHG source: SWI chunk, error-identifiers, the
+                          swi-decoding-table - this is what h/modhead comes from
+c/module                 SWI_* veneers - decode _kernel_swi_regs into typed
+                          locals, call the pipeline functions below, encode
+                          the result back into regs
+
+h/types                  Draw module data structures and constants (Draw_PathElement,
+                          Draw_Tag, Draw_CapStyle, Draw_JoinStyle, Draw_LineStyle,
+                          Draw_DashPattern, OS_Coord, Draw_FillStyle, ...)
+h/bufferdata, c/bufferdata   Third-party-style buffer writer with overflow
+                          tracking (see below)
+h/global                 Empty placeholder required by h/bufferdata's
+                          #include "global.h" (the project's per-project
+                          global header; nothing needed here yet)
 
 h/geometry, c/geometry   Vec2 and 2D vector helpers (unit_dir, offset_point, coord<->vec)
 h/pathio,   c/pathio     Reading (Subpath, path_read_subpath) and writing
@@ -33,6 +46,9 @@ h/cap,      c/cap        cap() - thicken() with real line-cap styles instead of
                          butt; also holds cap_emit(), the cap-shape geometry
                          (see h/cap_internal)
 h/dash,     c/dash       dash() - applies a Draw_DashPattern
+h/fill,     c/fill       fill() - scanline rasterisation of a flattened path,
+                         honouring all four Draw winding rules; calls back
+                         through a caller-supplied Fill_Render (hline/polyhline)
 
 h/thicken_internal      GappedPath + thicken_read_gapped_subpath() +
                          thicken_process_gapped(), exposed ONLY for c/cap to reuse -
@@ -40,22 +56,26 @@ h/thicken_internal      GappedPath + thicken_read_gapped_subpath() +
 h/cap_internal           cap_emit(), exposed ONLY for c/thicken to call from
                          thicken_emit_open() - not part of cap's public API in h/cap
 
-h/fill,     c/fill       fill() - scanline rasterisation of a flattened path,
-                         honouring all four Draw winding rules; calls back
-                         through a caller-supplied Fill_Render (hline/polyhline)
-
-c/main                  Test program only: show_path() (debug dump/plot),
+c/test                  Test program only (built as a standalone AIF, not
+                         part of the module): show_path() (debug dump/plot),
                          report_space() (overflow reporting), render_hline()/
                          render_polyhline() (dumb Fill_Render callbacks),
                          test_flattening(), test_capping(), test_filling(),
                          main()
 
-draw.xml                PRM-in-XML source for the Draw module chapter (data
-                         structure descriptions used as the spec for this project;
-                         SWIs described in it cannot actually be called - there is
-                         no Draw module here, only the path-buffer format)
-GOAL.md, thickening.md   Original task briefs for the flattening and thickening work
-Makefile,fe1             OBJS lists every module above; TYPE=aif, LIBS=${CLIB}
+Makefile,fe1             The module's own build (CModule) - builds c/module
+                         plus every pipeline .c file into oz32/, then rm32
+MakefileTest,fec          Secondary makefile (LibraryCommand) for the c/test
+                         AIF - builds the same pipeline .c files again into
+                         o32/ (a different object directory, so it never
+                         clashes with the module build) plus o.test, linking
+                         to aif32.DrawTest. Not picked up automatically by
+                         plain `riscos-amu` - invoke it explicitly (see
+                         Building, running, testing below)
+
+flattening/draw.xml               PRM-in-XML source for the Draw module chapter
+flattening/GOAL.md, thickening.md  Original task briefs for the flattening and
+                                   thickening work
 ```
 
 `h/*` and `c/*` pair up by leaf name (`h/thicken` + `c/thicken`), except
@@ -88,13 +108,13 @@ thickened outline read as solid rather than as a hairline outline of itself.
 Each stage takes an already-processed path as `inpath` and writes a new
 path into `outpath`; the test harness ping-pongs between the two static
 `in_buffer`/`out_buffer` arrays with a `memcpy` between stages (see
-`test_flattening()`). Every stage's `outpath` must start with a placeholder
-`Draw_EndPath` element whose `data.end_path` field gives the buffer's spare
-byte capacity - the standard Draw module output-buffer convention (see
-`draw.xml` / the `riscos-output` skill's `draw.md`) - and every stage
-returns the standard RISC OS space-report: positive spare bytes on success,
-or `-(bytes that would have been required)` on overflow. See
-`path_write_result()` in `h/pathio` and `report_space()` in `c/main` for how
+`test_flattening()` in `c/test`). Every stage's `outpath` must start with a
+placeholder `Draw_EndPath` element whose `data.end_path` field gives the
+buffer's spare byte capacity - the standard Draw module output-buffer
+convention (see `draw.xml` / the `riscos-output` skill's `draw.md`) - and
+every stage returns the standard RISC OS space-report: positive spare bytes
+on success, or `-(bytes that would have been required)` on overflow. See
+`path_write_result()` in `h/pathio` and `report_space()` in `c/test` for how
 that's produced and consumed.
 
 `fill()` is the odd one out: it's the terminal stage, so it doesn't write a
@@ -138,37 +158,64 @@ specific problem), not the buffer space-report convention above.
 
 The general implementation notes worth keeping (mitre-point formula, the
 two-ring closed-subpath technique, cap geometry per style, why gaps don't
-break a subpath) have been written up generically in the local
-`riscos-output` skill shadow's `references/draw.md`, under "Implementing
-your own path thickening" - read that rather than re-deriving it, and keep
-it updated if the algorithms change.
+break a subpath, the winding-rule/scanline algorithm) have been written up
+generically in the local `riscos-output` skill shadow's `references/draw.md`
+- read that rather than re-deriving it, and keep it updated if the
+algorithms change.
+
+## Module integration status
+
+* **Floating point.** The pipeline originally used `double` (sqrt/sin/cos)
+  throughout - fine for a standalone AIF, but modules shouldn't use FP
+  without wrapping SVC-mode entry with `Asm/fpsvc.h` save/restore (see
+  `using-libasm`). Rather than do that, the geometry/thicken/cap/dash/fill
+  maths is being reworked to integer/fixed-point so the module never touches
+  the FPU at all. Track progress on this in the code itself (`h/geometry`'s
+  `Vec2` and friends) rather than here, since this note will go stale fast.
+* **SWI wiring.** `c/module`'s veneers decode registers and are being filled
+  in to call the pipeline functions above. `Draw_FlattenPath`,
+  `Draw_TransformPath`, `Draw_StrokePath` and `Draw_ProcessPath`'s
+  buffer-output mode write to an output path buffer, exactly like the
+  pipeline already does. `Draw_Fill`/`Draw_Stroke` render straight to the
+  VDU - these are backed by an `OS_Plot`-based `Fill_Render` implemented in
+  `c/module` (or a dedicated file - check current layout) that turns
+  `fill()`'s hline/polyhline callbacks into real screen output.
+  `Draw_FillClipped`/`Draw_StrokeClipped` (RISC OS 5+, clip descriptors) and
+  the FP-vector SWI slots (`Draw_1`, `Draw_3`, ... - the unnamed odd-numbered
+  entries in the swi-decoding-table) are out of scope for now and continue
+  to report `err_DrawUnimplementedDraw`/`error_BAD_SWI` as they did before
+  this work started. The "DrawV" vector-claiming mechanism (`DrawV_Reason`
+  in `h/types`, for printer drivers etc. to intercept Draw calls) is also
+  out of scope for now.
 
 ## Building, running, testing
 
-Standard build-environment flow (see the `riscos-build-environment` skill):
+Standard build-environment flow (see the `riscos-build-environment` skill).
+Two separate makefiles live at the top level:
 
 ```
-riscos-amu
-riscos-build-run aif32 --command "aif32.DrawFlattening"
+riscos-amu                                     # builds the Draw module itself (Makefile,fe1 / CModule)
+riscos-amu -f MakefileTest,fec                 # builds the standalone test AIF (aif32.DrawTest)
+riscos-build-run aif32 --command "aif32.DrawTest"
 ```
 
-`main()` runs `test_flattening()` (flatten -> dash -> thicken on a
-curved-corner shape), `test_capping()` (all four cap styles on a bent line),
-then `test_filling()` (all four winding rules on a self-intersecting
+`main()` in `c/test` runs `test_flattening()` (flatten -> dash -> thicken on
+a curved-corner shape), `test_capping()` (all four cap styles on a bent
+line), then `test_filling()` (all four winding rules on a self-intersecting
 pentagram - the classic shape for telling winding rules apart: the star's
 points get a winding number of 1, its self-crossed centre gets 2). The first
 two print a `stage: ok (N bytes spare)` / `stage: buffer too small - ...`
 line per stage via `report_space()`, then dump the resulting path as text
 and plot it with `OS_Plot`. `test_filling()` instead prints one `hline
 y=... x=...` line per run via the dumb `render_hline()`/`render_polyhline()`
-callbacks in `c/main` (which also plot each run with `OS_Plot`), so you can
+callbacks in `c/test` (which also plot each run with `OS_Plot`), so you can
 see exactly which pixels each winding rule decided were interior.
 
 **To see the plotted graphics without the console text dump obscuring
 them**, redirect the program's stdout when running it:
 
 ```
-riscos-build-run aif32 --command "aif32.DrawFlattening > stdout" \
+riscos-build-run aif32 --command "aif32.DrawTest > stdout" \
     --command "*screensave -native screen" --return-file screen --return-to screen.png
 ```
 
@@ -250,3 +297,12 @@ the plot.
   eye would suggest. Verify winding sign empirically (or trace it through
   the actual vertex order) rather than assuming a "conventional" CCW/CW
   direction is positive.
+* **Modules can't casually use floating point.** `writing-cmodules`
+  guidance is explicit that FP needs `Asm/fpsvc.h` save/restore around SVC
+  mode entry, or should just be avoided. Since this pipeline started as an
+  AIF-only exercise, it leant on `double` (sqrt for vector length/mitre
+  length, sin/cos for round caps) throughout - all of that has to be (or is
+  being) converted to fixed-point/integer arithmetic before `c/module` can
+  safely call into it. `c/test`'s AIF build is unaffected either way (user
+  code doesn't have the same restriction), so this is purely a
+  module-integration concern, not a test-harness one.

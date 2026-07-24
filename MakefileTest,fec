@@ -1,11 +1,16 @@
 #!/usr/bin/env riscos-amu -f
-# Makefile for DrawFlattening
+# Makefile for DrawTest - the flatten/dash/thicken/cap/fill pipeline test
+# harness, sharing c/ and h/ with the Draw module itself. This is a
+# secondary makefile (not the component's Makefile,fe1, which builds the
+# module) - invoke it explicitly:
+#
+#   riscos-amu -f MakefileTest,fec
 #
 
 #
 # Program specific options:
 #
-COMPONENT  = DrawFlattening
+COMPONENT  = DrawTest
 
 # Specifies additional targets for startup
 #INITTARGET = inittarget
@@ -32,8 +37,11 @@ CDEFINES   =
 # Space separated list of libraries to link against, eg C:LibName.o.libLibName
 LIBS       = ${CLIB}
 
-# Objects to build, using the format o.<name> (will be varied for build type)
-OBJS       = o.main o.bufferdata o.geometry o.pathio o.flatten o.thicken o.cap o.dash o.fill
+# Objects to build, using the format o.<name> (will be varied for build type).
+# The library objects (everything but o.test) are shared with the Draw
+# module's own Makefile,fe1 - they land in o32 here and oz32 for the module
+# build, so the two builds never clash even though the sources are shared.
+OBJS       = o.test o.bufferdata o.geometry o.pathio o.flatten o.thicken o.cap o.dash o.fill
 
 # Space separated list of XML files for building documentation.
 #DOCSRC = <prm-in-xml-sources>
