@@ -1,0 +1,63 @@
+REM >TestMultiSubpath
+REM Draw module test: a single path containing two independent subpaths
+REM (each its own MoveTo...Close), filled in one Draw_Fill call. Left
+REM shape: two disjoint squares (checks that fill() correctly restarts at
+REM each subpath's own MoveTo rather than treating the whole path as one
+REM contour). Right shape: an outer square with a smaller inner square
+REM subpath, evenodd-filled, which should render as a hollow frame (a
+REM hole cut by the second subpath) - checks winding accumulates across
+REM subpath boundaries within a single fill.
+ON ERROR ERROR EXT ERR, REPORT$ + " at line " + STR$(ERL/10)
+
+MODE "X640 Y480 C256"
+SYS "ColourTrans_SetGCOL", &FFFFFF00,,,128,0
+CLG
+SYS "ColourTrans_SetGCOL", &000000FF,,,0,0
+
+DIM path% 256
+
+REM Two disjoint squares, one path, nonzero fill
+p% = path%
+PROCsquare(&1000, &8000, &2000)
+PROCsquare(&5000, &8000, &2000)
+PROCendpath
+SYS "Draw_Fill", path%, &30, 0, 0
+
+REM Outer + inner square (a hole), evenodd fill
+p% = path%
+PROCsquare(&9000, &8000, &4000)
+PROCsquare(&A000, &9000, &2000)
+PROCendpath
+SYS "Draw_Fill", path%, &32, 0, 0
+
+*ScreenSave -native screen
+END
+
+REM A closed square subpath with bottom-left corner (ox,oy) and side s
+DEFPROCsquare(ox%, oy%, s%)
+PROCmoveto(ox%, oy%)
+PROClineto(ox%+s%, oy%)
+PROClineto(ox%+s%, oy%+s%)
+PROClineto(ox%, oy%+s%)
+PROCcloseline
+ENDPROC
+
+DEFPROCmoveto(x%,y%)
+!p% = 2 : p%!4 = x% : p%!8 = y%
+p% += 12
+ENDPROC
+
+DEFPROClineto(x%,y%)
+!p% = 8 : p%!4 = x% : p%!8 = y%
+p% += 12
+ENDPROC
+
+DEFPROCcloseline
+!p% = 5
+p% += 4
+ENDPROC
+
+DEFPROCendpath
+!p% = 0 : p%!4 = 0
+p% += 8
+ENDPROC

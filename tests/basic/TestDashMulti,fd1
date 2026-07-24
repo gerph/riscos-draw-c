@@ -1,0 +1,48 @@
+REM >TestDashMulti
+REM Draw module test: Draw_Stroke with a 4-element dash pattern (two
+REM different on/off widths, alternating: long-on, short-off, short-on,
+REM long-off) and a nonzero pattern "start" offset, on a single long
+REM line. TestDash only exercised a simple 2-element on/off pattern
+REM starting at 0 - this checks dash() correctly cycles through more than
+REM one on/off pair and honours a mid-pattern starting phase.
+ON ERROR ERROR EXT ERR, REPORT$ + " at line " + STR$(ERL/10)
+
+MODE "X640 Y480 C256"
+SYS "ColourTrans_SetGCOL", &FFFFFF00,,,128,0
+CLG
+SYS "ColourTrans_SetGCOL", &800080FF,,,0,0
+
+DIM path% 64
+DIM trfm% 24
+trfm%!0 = (1<<16) : trfm%!4 = 0
+trfm%!8 = 0        : trfm%!12 = (1<<16)
+trfm%!16 = 0        : trfm%!20 = 0
+
+DIM lstyle% 16
+!lstyle% = 0        : REM mitred join, butt caps
+lstyle%!4 = &40000   : REM mitre limit 4.0 (16.16)
+lstyle%!8 = 0
+lstyle%!12 = 0
+
+DIM dashpat% 32
+!dashpat% = 1200     : REM start - a phase offset into the pattern below
+dashpat%!4 = 4        : REM element_count
+dashpat%!8 = 2400      : REM on  (long)
+dashpat%!12 = 800      : REM off (short)
+dashpat%!16 = 800      : REM on  (short)
+dashpat%!20 = 2400      : REM off (long)
+
+p% = path%
+!p% = 2 : p%!4 = &1000 : p%!8 = &8000
+p% += 12
+!p% = 8 : p%!4 = &1F000 : p%!8 = &8000
+p% += 12
+!p% = 0 : p%!4 = 0
+
+REM Thickness kept well above 2 OS units (512 in Draw units) - below that,
+REM the reference module drops a dashed stroke entirely (see AGENTS.md);
+REM this test isolates dash()'s multi-element/start-offset handling, not
+REM that separate thin-line behaviour.
+SYS "Draw_Stroke", path%, &30, trfm%, 256, 1500, lstyle%, dashpat%
+
+*ScreenSave -native screen

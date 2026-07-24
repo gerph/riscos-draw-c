@@ -280,18 +280,27 @@ the plot.
 
 ### BASIC screenshot comparison suite (`tests/basic/`)
 
-Four BASIC programs drive the module's SWI veneers directly (rather than
+Nine BASIC programs drive the module's SWI veneers directly (rather than
 calling the pipeline C functions like `c/test` does) and `*ScreenSave` the
 result, so the same script can be run unchanged against either the
 project's own built module or a real reference `Draw` module for a visual
 diff:
 
 ```
-TestFill    Draw_Fill, all four winding rules, on the same pentagram as c/test's test_filling()
-TestCurve   Draw_Fill on a path with a BezierTo edge, at two flatness values
-TestStroke  Draw_Stroke, all four cap styles, on the same bent line as c/test's test_capping()
-TestDash    Draw_Stroke with a dash pattern, on an open line and a closed square
+TestFill          Draw_Fill, all four winding rules, on the same pentagram as c/test's test_filling()
+TestCurve         Draw_Fill on a path with a BezierTo edge, at two flatness values
+TestStroke        Draw_Stroke, all four cap styles, on the same bent line as c/test's test_capping()
+TestDash          Draw_Stroke with a dash pattern, on an open line and a closed square
+TestTransform     Draw_Fill with a non-identity trfm (rotation + scale + translation)
+TestMultiSubpath  Draw_Fill on a path with two independent subpaths in one call (disjoint squares, and an evenodd hole)
+TestSpecialMove   Draw_Fill where a second subpath starts with Draw_SpecialMoveTo, which must not affect winding
+TestClosedStroke  Draw_Stroke on a closed subpath (the two-ring annulus case, distinct from an open/capped run)
+TestDashMulti     Draw_Stroke with a 4-element dash pattern and a nonzero pattern "start" phase offset
 ```
+
+All nine currently match a real reference module pixel-for-pixel (bar a
+handful of sub-pixel-rounding pixels along dash boundaries in
+`TestDashMulti`, not a structural mismatch).
 
 Run one against the built module:
 
@@ -321,6 +330,15 @@ stroke pipeline is broken" until you compare against a minimal known-good
 call and narrow down which argument is at fault. `Draw_Fill` does not have
 this problem - `0`/NULL there behaves as documented on both this project's
 module and a real one.
+
+**A real Draw module also appears to drop an entire dashed stroke below
+about 2 OS units of thickness** (512 in Draw units, `Draw_OSUnit*2`) -
+found via `TestDashMulti`, whose original 500-unit thickness rendered on
+this project's module but nothing at all on a real one; 512+ renders in
+both. This project's `dash()`/`thicken()` have no such lower bound.
+Whether this is a genuine minimum-width rendering rule in real Draw or
+specific to the reference binary tested isn't confirmed - noted here so a
+future thin-dashed-line comparison isn't mistaken for a broken test.
 
 ## Caveats and gotchas found while building this
 

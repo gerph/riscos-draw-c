@@ -1,0 +1,59 @@
+REM >TestSpecialMove
+REM Draw module test: a solid square with a second subpath that starts
+REM with Draw_SpecialMoveTo (tag 3, not Draw_MoveTo) instead of an
+REM ordinary MoveTo. Per its PRM definition a SpecialMoveTo subpath "does
+REM not affect winding numbers when filling" - so even though the second
+REM subpath traces a smaller square nested inside the first (which would
+REM cut a hole if it were an ordinary MoveTo subpath under the nonzero
+REM rule), the result should be a single, fully solid square with no
+REM hole at all.
+ON ERROR ERROR EXT ERR, REPORT$ + " at line " + STR$(ERL/10)
+
+MODE "X640 Y480 C256"
+SYS "ColourTrans_SetGCOL", &FFFFFF00,,,128,0
+CLG
+SYS "ColourTrans_SetGCOL", &000000FF,,,0,0
+
+DIM path% 128
+
+p% = path%
+REM Outer square - ordinary MoveTo, contributes to winding as normal
+PROCmoveto(&4000, &4000)
+PROClineto(&C000, &4000)
+PROClineto(&C000, &C000)
+PROClineto(&4000, &C000)
+PROCcloseline
+
+REM Inner square - Draw_SpecialMoveTo (tag 3), should NOT punch a hole
+!p% = 3 : p%!4 = &6000 : p%!8 = &6000
+p% += 12
+PROClineto(&A000, &6000)
+PROClineto(&A000, &A000)
+PROClineto(&6000, &A000)
+PROCcloseline
+
+PROCendpath
+SYS "Draw_Fill", path%, &30, 0, 0
+
+*ScreenSave -native screen
+END
+
+DEFPROCmoveto(x%,y%)
+!p% = 2 : p%!4 = x% : p%!8 = y%
+p% += 12
+ENDPROC
+
+DEFPROClineto(x%,y%)
+!p% = 8 : p%!4 = x% : p%!8 = y%
+p% += 12
+ENDPROC
+
+DEFPROCcloseline
+!p% = 5
+p% += 4
+ENDPROC
+
+DEFPROCendpath
+!p% = 0 : p%!4 = 0
+p% += 8
+ENDPROC

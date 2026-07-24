@@ -1,0 +1,37 @@
+REM >TestTransform
+REM Draw module test: Draw_Fill with a non-identity trfm (rotation, scale
+REM and translation combined), to exercise transform() via the SWI path -
+REM none of the other tests here pass a non-NULL trfm. Draws the same
+REM triangle twice: once untransformed (grey outline reference position),
+REM once through a 30 degree rotation + 1.5x scale + translation, so a
+REM wrong transform shows up as the black triangle landing in the wrong
+REM place/size/orientation relative to the grey one.
+ON ERROR ERROR EXT ERR, REPORT$ + " at line " + STR$(ERL/10)
+
+MODE "X640 Y480 C256"
+SYS "ColourTrans_SetGCOL", &FFFFFF00,,,128,0
+CLG
+
+DIM path% 64
+!path% = 2 : path%!4 = &10000 : path%!8 = &10000
+path%!12 = 8 : path%!16 = &50000 : path%!20 = &10000
+path%!24 = 8 : path%!28 = &10000 : path%!32 = &40000
+path%!36 = 5
+path%!40 = 0 : path%!44 = 0
+
+REM Reference position: no transform, light grey
+SYS "ColourTrans_SetGCOL", &C0C0C000,,,0,0
+SYS "Draw_Fill", path%, &30, 0, 0
+
+REM Same triangle, rotated 30 degrees, scaled 1.5x, translated - black
+DIM trfm% 24
+angle = 30 * PI / 180
+scale = 1.5
+trfm%!0 = scale * COS(angle) * 65536 : trfm%!4 = scale * SIN(angle) * 65536
+trfm%!8 = -scale * SIN(angle) * 65536 : trfm%!12 = scale * COS(angle) * 65536
+trfm%!16 = &28000 : trfm%!20 = &18000
+
+SYS "ColourTrans_SetGCOL", &FF000000,,,0,0
+SYS "Draw_Fill", path%, &30, trfm%, 0
+
+*ScreenSave -native screen

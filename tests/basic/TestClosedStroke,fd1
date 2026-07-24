@@ -1,0 +1,57 @@
+REM >TestClosedStroke
+REM Draw module test: Draw_Stroke on a CLOSED subpath (a square), rather
+REM than the open bent lines used elsewhere. Per AGENTS.md, a closed
+REM subpath with no gaps becomes two rings wound in opposite directions
+REM (an annulus) rather than one capped run - this is a distinct code
+REM path from the open-line case and untested elsewhere in this suite.
+ON ERROR ERROR EXT ERR, REPORT$ + " at line " + STR$(ERL/10)
+
+MODE "X640 Y480 C256"
+SYS "ColourTrans_SetGCOL", &FFFFFF00,,,128,0
+CLG
+SYS "ColourTrans_SetGCOL", &00008000,,,0,0
+
+DIM path% 128
+DIM trfm% 24
+trfm%!0 = (1<<16) : trfm%!4 = 0
+trfm%!8 = 0        : trfm%!12 = (1<<16)
+trfm%!16 = 0        : trfm%!20 = 0
+
+DIM lstyle% 16
+!lstyle% = 0        : REM mitred join, butt caps (caps unused - path is closed)
+lstyle%!4 = &40000   : REM mitre limit 4.0 (16.16)
+lstyle%!8 = 0
+lstyle%!12 = 0
+
+p% = path%
+PROCmoveto(&4000, &4000)
+PROClineto(&C000, &4000)
+PROClineto(&C000, &C000)
+PROClineto(&4000, &C000)
+PROCcloseline
+PROCendpath
+
+SYS "Draw_Stroke", path%, &30, trfm%, 256, 2000, lstyle%, 0
+
+*ScreenSave -native screen
+END
+
+DEFPROCmoveto(x%,y%)
+!p% = 2 : p%!4 = x% : p%!8 = y%
+p% += 12
+ENDPROC
+
+DEFPROClineto(x%,y%)
+!p% = 8 : p%!4 = x% : p%!8 = y%
+p% += 12
+ENDPROC
+
+DEFPROCcloseline
+!p% = 5
+p% += 4
+ENDPROC
+
+DEFPROCendpath
+!p% = 0 : p%!4 = 0
+p% += 8
+ENDPROC
