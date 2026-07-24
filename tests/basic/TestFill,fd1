@@ -1,0 +1,76 @@
+REM >TestFill
+REM Draw module test: Draw_Fill with all four winding rules, on the same
+REM self-intersecting pentagram used by c/test's test_filling() (five
+REM pentagon points joined in star order 0-2-4-1-3). Every point of the
+REM star has a winding number of 1; the centre pentagon (covered twice by
+REM the crossing path) has a winding number of 2. Nonzero and positive
+REM both fill the whole star solid; evenodd leaves the centre pentagon
+REM unfilled; negative fills nothing (the path never winds negative).
+REM
+REM Run this unchanged against either module under test - RMLoad it first,
+REM then `Run TestFill`, then compare the resulting screenshot:
+REM   RMLoad rm32.Draw          (module built by this project)
+REM   RMLoad DrawMod            (reference implementation)
+ON ERROR ERROR EXT ERR, REPORT$ + " at line " + STR$(ERL/10)
+
+MODE "X640 Y480 C256"
+SYS "ColourTrans_SetGCOL", &FFFFFF00,,,128,0
+CLG
+SYS "ColourTrans_SetGCOL", &000000FF,,,0,0
+
+DIM path% 128
+radius% = 60*256
+
+REM Layout (OS units, y=0 at bottom): top-left=nonzero, top-right=evenodd,
+REM bottom-left=positive, bottom-right=negative (expected blank - the
+REM path never winds negative)
+PROCstar(160*256, 340*256, &30)
+PROCstar(480*256, 340*256, &32)
+PROCstar(160*256, 140*256, &33)
+PROCstar(480*256, 140*256, &31)
+
+*ScreenSave -native screen
+END
+
+DEFPROCstar(cx%, cy%, fillstyle%)
+LOCAL order%(), vx%(), vy%(), i%, ang
+DIM order%(4)
+order%(0)=0 : order%(1)=2 : order%(2)=4 : order%(3)=1 : order%(4)=3
+DIM vx%(4), vy%(4)
+FOR i%=0 TO 4
+  ang = -PI/2 + i% * (2*PI/5)
+  vx%(i%) = cx% + radius% * COS(ang)
+  vy%(i%) = cy% + radius% * SIN(ang)
+NEXT
+
+p% = path%
+PROCmoveto(vx%(order%(0)), vy%(order%(0)))
+PROClineto(vx%(order%(1)), vy%(order%(1)))
+PROClineto(vx%(order%(2)), vy%(order%(2)))
+PROClineto(vx%(order%(3)), vy%(order%(3)))
+PROClineto(vx%(order%(4)), vy%(order%(4)))
+PROCcloseline
+PROCendpath
+
+SYS "Draw_Fill", path%, fillstyle%, 0, 0
+ENDPROC
+
+DEFPROCmoveto(x%,y%)
+!p% = 2 : p%!4 = x% : p%!8 = y%
+p% += 12
+ENDPROC
+
+DEFPROClineto(x%,y%)
+!p% = 8 : p%!4 = x% : p%!8 = y%
+p% += 12
+ENDPROC
+
+DEFPROCcloseline
+!p% = 5
+p% += 4
+ENDPROC
+
+DEFPROCendpath
+!p% = 0 : p%!4 = 0
+p% += 8
+ENDPROC

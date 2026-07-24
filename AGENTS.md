@@ -278,6 +278,50 @@ Then view `screen.png` (it's actually a Sprite despite the name). Without
 the `> stdout` redirect, the text dump fills most of the screen and hides
 the plot.
 
+### BASIC screenshot comparison suite (`tests/basic/`)
+
+Four BASIC programs drive the module's SWI veneers directly (rather than
+calling the pipeline C functions like `c/test` does) and `*ScreenSave` the
+result, so the same script can be run unchanged against either the
+project's own built module or a real reference `Draw` module for a visual
+diff:
+
+```
+TestFill    Draw_Fill, all four winding rules, on the same pentagram as c/test's test_filling()
+TestCurve   Draw_Fill on a path with a BezierTo edge, at two flatness values
+TestStroke  Draw_Stroke, all four cap styles, on the same bent line as c/test's test_capping()
+TestDash    Draw_Stroke with a dash pattern, on an open line and a closed square
+```
+
+Run one against the built module:
+
+```
+riscos-build-run rm32/Draw,ffa tests/basic/TestFill,fd1 \
+    --command "RMLoad Draw" --command "Run TestFill" \
+    --return-file screen --return-to screen.png
+```
+
+A real reference `Draw` module can be exercised the same way via
+`riscos-run` (needs a local Pyromaniac runtime - see the
+`debugging-with-pyromaniac` skill's `references/zeropage.md` for the
+`--config memorymap.zeropage_enable=yes`/`--config
+watchregions.lowmemory=no` incantations a genuine binary module typically
+needs, and for the fact that it may depend on other resident modules (eg
+`OSSWIs`) that aren't part of this project).
+
+**When comparing against a real Draw module, always pass real values, not
+`0`/NULL placeholders, for `Draw_Stroke`'s `trfm`, `flatness`, and
+`line_style`, and always give `line_style.mitre_limit` a real nonzero value
+(eg `&40000` = 4.0 in 16.16) whenever the path being stroked has an actual
+corner.** This project's own `Draw_Stroke` veneer tolerates `0`/NULL there
+and substitutes sensible defaults (see "Defaults substituted..." in
+`c/module`), but a real Draw module does not: it silently renders nothing
+at all (no error) if these are left as `0`, which looks identical to "the
+stroke pipeline is broken" until you compare against a minimal known-good
+call and narrow down which argument is at fault. `Draw_Fill` does not have
+this problem - `0`/NULL there behaves as documented on both this project's
+module and a real one.
+
 ## Caveats and gotchas found while building this
 
 * **Never assume a fixed path-element word size.** Elements are variable

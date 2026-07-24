@@ -1,0 +1,76 @@
+REM >TestStroke
+REM Draw module test: Draw_Stroke on the same bent open line (a right-
+REM angle corner) as c/test's test_capping(), once per cap style, so both
+REM the join and the cap geometry show up. Exercises thicken()/cap()
+REM (offset + mitre join + real cap shapes) via the SWI path rather than
+REM calling cap() directly.
+REM
+REM Run this unchanged against either module under test - RMLoad it first,
+REM then `Run TestStroke`, then compare the resulting screenshot:
+REM   RMLoad rm32.Draw          (module built by this project)
+REM   RMLoad DrawMod            (reference implementation)
+ON ERROR ERROR EXT ERR, REPORT$ + " at line " + STR$(ERL/10)
+
+MODE "X640 Y480 C256"
+SYS "ColourTrans_SetGCOL", &FFFFFF00,,,128,0
+CLG
+SYS "ColourTrans_SetGCOL", &00808000,,,0,0
+
+DIM path% 128
+DIM lstyle% 32
+
+REM Draw_Stroke on the reference module needs a real trfm pointer and an
+REM explicit flatness - passing 0 for either (fine for Draw_Fill) leaves
+REM it silently drawing nothing, see MinimalStroke
+DIM trfm% 24
+trfm%!0 = (1<<16) : trfm%!4 = 0
+trfm%!8 = 0        : trfm%!12 = (1<<16)
+trfm%!16 = 0        : trfm%!20 = 0
+flatness% = 256
+
+thickness% = 3000
+DIM cap_style%(3)
+cap_style%(0) = 0 : REM Draw_CapButt
+cap_style%(1) = 1 : REM Draw_CapRound
+cap_style%(2) = 2 : REM Draw_CapSquare
+cap_style%(3) = 3 : REM Draw_CapTriangular
+
+REM Layout (OS units, y=0 at bottom, rising): row order butt, round,
+REM square, triangular from bottom to top
+FOR i% = 0 TO 3
+  y% = (40 + i% * 100) * 256
+  PROCbentline(&2000, y%, &6000, y%, &6000, y% + &1800, cap_style%(i%))
+NEXT
+
+*ScreenSave -native screen
+END
+
+DEFPROCbentline(x0%,y0%,x1%,y1%,x2%,y2%, capstyle%)
+p% = path%
+PROCmoveto(x0%,y0%)
+PROClineto(x1%,y1%)
+PROClineto(x2%,y2%)
+PROCendpath
+
+!lstyle% = 0 + capstyle%*256 + capstyle%*65536
+lstyle%!4 = &40000 : REM mitre limit 4.0 (16.16) - 0 here silently drew nothing on the reference module once the path has an actual mitred corner, see AGENTS.md
+lstyle%!8 = 384 + 320*65536
+lstyle%!12 = 384 + 320*65536
+
+SYS "Draw_Stroke", path%, &30, trfm%, flatness%, thickness%, lstyle%, 0
+ENDPROC
+
+DEFPROCmoveto(x%,y%)
+!p% = 2 : p%!4 = x% : p%!8 = y%
+p% += 12
+ENDPROC
+
+DEFPROClineto(x%,y%)
+!p% = 8 : p%!4 = x% : p%!8 = y%
+p% += 12
+ENDPROC
+
+DEFPROCendpath
+!p% = 0 : p%!4 = 0
+p% += 8
+ENDPROC

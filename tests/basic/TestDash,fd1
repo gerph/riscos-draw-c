@@ -1,0 +1,98 @@
+REM >TestDash
+REM Draw module test: Draw_Stroke with a dash pattern, on an open
+REM three-point bent line (same shape as TestStroke) and on a closed
+REM square, to check dash() walking subpath length against the pattern
+REM (and that a gap does not split the subpath - a real Draw_CloseLine
+REM must still appear once dashing is done). Uses the same dash pattern
+REM as c/test's test_flattening() (on=1200, off=600).
+REM
+REM Run this unchanged against either module under test - RMLoad it first,
+REM then `Run TestDash`, then compare the resulting screenshot:
+REM   RMLoad rm32.Draw          (module built by this project)
+REM   RMLoad DrawMod            (reference implementation)
+ON ERROR ERROR EXT ERR, REPORT$ + " at line " + STR$(ERL/10)
+
+MODE "X640 Y480 C256"
+SYS "ColourTrans_SetGCOL", &FFFFFF00,,,128,0
+CLG
+SYS "ColourTrans_SetGCOL", &FF000000,,,0,0
+
+DIM path% 128
+DIM dashpat% 32
+REM Dash period kept coarse relative to the shapes' perimeter - a much
+REM finer pattern here can produce more dash segments than run_pipeline's
+REM per-stage scratch buffer (sized as a multiplier of the *input* size,
+REM see SCRATCH_MULTIPLIER/SCRATCH_MINIMUM in c/module) allows for, a
+REM known sizing limitation documented in AGENTS.md rather than a dash()
+REM bug - this is deliberately avoided so the test isolates dash()'s own
+REM correctness.
+!dashpat% = 0        : REM start
+dashpat%!4 = 2        : REM element_count
+dashpat%!8 = 2400      : REM on
+dashpat%!12 = 1200      : REM off
+
+REM Draw_Stroke on the reference module needs a real trfm pointer, an
+REM explicit flatness, and a real (non-NULL) line_style - passing 0 for
+REM any of these is fine for our own module but leaves the reference
+REM silently drawing nothing, see MinimalStroke
+DIM trfm% 24
+trfm%!0 = (1<<16) : trfm%!4 = 0
+trfm%!8 = 0        : trfm%!12 = (1<<16)
+trfm%!16 = 0        : trfm%!20 = 0
+flatness% = 256
+
+DIM lstyle% 16
+!lstyle% = 0        : REM join/cap styles: mitred join, butt caps
+lstyle%!4 = &40000   : REM mitre limit 4.0 (16.16) - 0 here silently drew nothing on the reference module once the path has an actual mitred corner, see AGENTS.md
+lstyle%!8 = 0
+lstyle%!12 = 0
+
+thickness% = 800
+
+REM Open bent line
+p% = path%
+PROCmoveto(&2000, &8000)
+PROClineto(&8000, &8000)
+PROClineto(&8000, &A800)
+PROCendpath
+SYS "Draw_Stroke", path%, &30, trfm%, flatness%, thickness%, lstyle%, dashpat%
+
+REM Closed square - a gap must not break the subpath, so the corner
+REM nearest the dash boundary should still look continuous, not
+REM disjointed into separate subpaths.
+p% = path%
+PROCmoveto(&C000, &8000)
+PROClineto(&12000, &8000)
+PROClineto(&12000, &E000)
+PROClineto(&C000, &E000)
+PROCcloseline
+PROCendpath
+SYS "Draw_Stroke", path%, &30, trfm%, flatness%, thickness%, lstyle%, dashpat%
+
+REM Layout (OS units): left=open dashed bent line, right=closed dashed
+REM square (the gap must not split the subpath - the square's outline
+REM should look continuous through every dash boundary, not be broken
+REM into disconnected pieces)
+
+*ScreenSave -native screen
+END
+
+DEFPROCmoveto(x%,y%)
+!p% = 2 : p%!4 = x% : p%!8 = y%
+p% += 12
+ENDPROC
+
+DEFPROClineto(x%,y%)
+!p% = 8 : p%!4 = x% : p%!8 = y%
+p% += 12
+ENDPROC
+
+DEFPROCcloseline
+!p% = 5
+p% += 4
+ENDPROC
+
+DEFPROCendpath
+!p% = 0 : p%!4 = 0
+p% += 8
+ENDPROC

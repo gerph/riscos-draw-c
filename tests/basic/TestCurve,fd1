@@ -1,0 +1,73 @@
+REM >TestCurve
+REM Draw module test: Draw_Fill on a path with a BezierTo edge, checking
+REM flatten()'s De Casteljau subdivision feeding into fill(). The shape is
+REM a square with one curved (concave) side, so a wrong flatness or a
+REM broken subdivision shows up as a visibly chunky/wrong curve rather
+REM than the smooth arc the reference module produces. Two copies are
+REM drawn at different explicit flatness values to also show flatness
+REM actually taking effect.
+REM
+REM Run this unchanged against either module under test - RMLoad it first,
+REM then `Run TestCurve`, then compare the resulting screenshot:
+REM   RMLoad rm32.Draw          (module built by this project)
+REM   RMLoad DrawMod            (reference implementation)
+ON ERROR ERROR EXT ERR, REPORT$ + " at line " + STR$(ERL/10)
+
+MODE "X640 Y480 C256"
+SYS "ColourTrans_SetGCOL", &FFFFFF00,,,128,0
+CLG
+SYS "ColourTrans_SetGCOL", &0000FFFF,,,0,0
+
+DIM path% 128
+
+REM Layout (OS units): left=fine flatness (1), right=coarse flatness (40)
+PROCcurvebox(80*256, 120*256, 256)
+PROCcurvebox(380*256, 120*256, 40*256)
+
+*ScreenSave -native screen
+END
+
+REM A 160x160 box (in draw units) with its top-right corner replaced by a
+REM concave quarter-circle-ish Bezier curve, same control-point shape as
+REM c/test's test_flattening() corner but scaled/positioned per instance
+REM and closed so it can be filled.
+DEFPROCcurvebox(ox%, oy%, flatness%)
+p% = path%
+PROCmoveto(ox%,            oy%)
+PROClineto(ox%+160*256,    oy%)
+PROClineto(ox%+160*256,    oy%+160*256)
+PROCbezierto(ox%+120*256, oy%+160*256,  ox%+80*256, oy%+120*256,  ox%+80*256, oy%+80*256)
+PROClineto(ox%+80*256,     oy%)
+PROCcloseline
+PROCendpath
+
+SYS "Draw_Fill", path%, &30, 0, flatness%
+ENDPROC
+
+DEFPROCmoveto(x%,y%)
+!p% = 2 : p%!4 = x% : p%!8 = y%
+p% += 12
+ENDPROC
+
+DEFPROClineto(x%,y%)
+!p% = 8 : p%!4 = x% : p%!8 = y%
+p% += 12
+ENDPROC
+
+DEFPROCbezierto(c1x%,c1y%,c2x%,c2y%,ex%,ey%)
+!p% = 6
+p%!4 = c1x% : p%!8 = c1y%
+p%!12 = c2x% : p%!16 = c2y%
+p%!20 = ex% : p%!24 = ey%
+p% += 28
+ENDPROC
+
+DEFPROCcloseline
+!p% = 5
+p% += 4
+ENDPROC
+
+DEFPROCendpath
+!p% = 0 : p%!4 = 0
+p% += 8
+ENDPROC
