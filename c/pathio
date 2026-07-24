@@ -97,11 +97,31 @@ void path_write_moveto(bufferdata_t *buf, OS_Coord p)
     bufferdata_complete(buf);
 }
 
+void path_write_specialmoveto(bufferdata_t *buf, OS_Coord p)
+{
+    path_write_tag(buf, Draw_SpecialMoveTo);
+    bufferdata_write_word(buf, (uint32_t)p.x);
+    bufferdata_write_word(buf, (uint32_t)p.y);
+    bufferdata_complete(buf);
+}
+
 void path_write_lineto(bufferdata_t *buf, OS_Coord p)
 {
     path_write_tag(buf, Draw_LineTo);
     bufferdata_write_word(buf, (uint32_t)p.x);
     bufferdata_write_word(buf, (uint32_t)p.y);
+    bufferdata_complete(buf);
+}
+
+void path_write_bezierto(bufferdata_t *buf, OS_Coord c1, OS_Coord c2, OS_Coord end)
+{
+    path_write_tag(buf, Draw_BezierTo);
+    bufferdata_write_word(buf, (uint32_t)c1.x);
+    bufferdata_write_word(buf, (uint32_t)c1.y);
+    bufferdata_write_word(buf, (uint32_t)c2.x);
+    bufferdata_write_word(buf, (uint32_t)c2.y);
+    bufferdata_write_word(buf, (uint32_t)end.x);
+    bufferdata_write_word(buf, (uint32_t)end.y);
     bufferdata_complete(buf);
 }
 

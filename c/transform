@@ -1,0 +1,76 @@
+/*******************************************************************
+ * File:        transform
+ * Purpose:     Applying a transformation matrix to every coordinate in a
+ *              Draw path
+ * Author:      Gerph
+ ******************************************************************/
+
+#include "transform.h"
+#include "pathio.h"
+#include "geometry.h"
+#include "Asm/muldiv.h"
+
+/* Scale factor 1.0 = &10000 in transform units (16.16 fixed) - the same
+ * scale as GEOMETRY_FIXED_ONE, so it's reused here rather than redefined. */
+#define TRANSFORM_UNIT (GEOMETRY_FIXED_ONE)
+
+static OS_Coord transform_point(OS_Coord p, OS_Trfm *trfm)
+{
+    int32_t a = trfm->entries[0][0], b = trfm->entries[0][1];
+    int32_t c = trfm->entries[1][0], d = trfm->entries[1][1];
+    int32_t e = trfm->entries[2][0], f = trfm->entries[2][1];
+    OS_Coord r;
+
+    r.x = muldiv(a, p.x, TRANSFORM_UNIT) + muldiv(c, p.y, TRANSFORM_UNIT) + e;
+    r.y = muldiv(b, p.x, TRANSFORM_UNIT) + muldiv(d, p.y, TRANSFORM_UNIT) + f;
+    return r;
+}
+
+int32_t transform(Draw_PathElement *inpath, Draw_PathElement *outpath, OS_Trfm *trfm)
+{
+    bufferdata_t buf;
+
+    path_writer_init(&buf, outpath);
+
+    while (inpath->tag != Draw_EndPath)
+    {
+        switch (inpath->tag)
+        {
+            case Draw_MoveTo:
+                path_write_moveto(&buf, transform_point(inpath->data.move_to, trfm));
+                break;
+
+            case Draw_SpecialMoveTo:
+                path_write_specialmoveto(&buf, transform_point(inpath->data.special_move_to, trfm));
+                break;
+
+            case Draw_LineTo:
+                path_write_lineto(&buf, transform_point(inpath->data.line_to, trfm));
+                break;
+
+            case Draw_GapTo:
+                path_write_gapto(&buf, transform_point(inpath->data.gap_to, trfm));
+                break;
+
+            case Draw_BezierTo:
+                path_write_bezierto(&buf,
+                                     transform_point(inpath->data.bezier_to[0], trfm),
+                                     transform_point(inpath->data.bezier_to[1], trfm),
+                                     transform_point(inpath->data.bezier_to[2], trfm));
+                break;
+
+            case Draw_CloseGap:
+            case Draw_CloseLine:
+                path_write_close(&buf, inpath->tag);
+                break;
+
+            default:
+                break;
+        }
+
+        inpath = advance_element(inpath);
+    }
+
+    path_write_endpath(&buf);
+    return path_write_result(&buf);
+}

@@ -88,6 +88,20 @@ void path_writer_init(bufferdata_t *buf, Draw_PathElement *outpath);
 void path_write_moveto(bufferdata_t *buf, OS_Coord p);
 
 /*************************************************** Gerph *********
+ Function:      path_write_specialmoveto
+ Description:   Write a SpecialMoveTo element - a MoveTo that does not
+                affect winding numbers when filling. Only transform()
+                writes these, to preserve that distinction through a
+                transform - every other stage either works on
+                already-flattened paths where it simply passes through, or
+                doesn't touch it at all
+ Parameters:    buf-> the path writer
+                p = the point to move to
+ Returns:       none
+ ******************************************************************/
+void path_write_specialmoveto(bufferdata_t *buf, OS_Coord p);
+
+/*************************************************** Gerph *********
  Function:      path_write_lineto
  Description:   Write a LineTo element
  Parameters:    buf-> the path writer
@@ -95,6 +109,18 @@ void path_write_moveto(bufferdata_t *buf, OS_Coord p);
  Returns:       none
  ******************************************************************/
 void path_write_lineto(bufferdata_t *buf, OS_Coord p);
+
+/*************************************************** Gerph *********
+ Function:      path_write_bezierto
+ Description:   Write a BezierTo element. Only transform() writes these -
+                every other stage requires an already-flattened input and
+                so never needs to emit a curve
+ Parameters:    buf-> the path writer
+                c1, c2 = the curve's control points
+                end = the curve's endpoint
+ Returns:       none
+ ******************************************************************/
+void path_write_bezierto(bufferdata_t *buf, OS_Coord c1, OS_Coord c2, OS_Coord end);
 
 /*************************************************** Gerph *********
  Function:      path_write_gapto

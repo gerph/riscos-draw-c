@@ -8,10 +8,19 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "kernel.h"
+#include "swis.h"
 #include "modhead.h"
 #include "types.h"
+#include "pathio.h"
+#include "flatten.h"
+#include "dash.h"
+#include "thicken.h"
+#include "cap.h"
+#include "fill.h"
+#include "transform.h"
 
 
 /* Define this to debug this file */
@@ -25,6 +34,276 @@
 #endif
 
 
+/* Defaults substituted when a SWI parameter is passed as 0 ("use the
+ * default"). See AGENTS.md's "Module integration status" for the
+ * reasoning behind each of these. */
+#define DRAW_DEFAULT_FLATNESS        (Draw_OSUnit)         /* within the PRM's recommended half-to-one-pixel range for a roughly 1:1 transform */
+#define DRAW_DEFAULT_FILLSTYLE       ((Draw_FillStyle)0x30) /* Draw_Fill's own documented default: fill to halfway through boundary, non-zero rule */
+#define DRAW_DEFAULT_FILLSTYLE_THIN  ((Draw_FillStyle)0x18) /* Draw_Stroke's documented default when R4=0 - same winding rule as above to fill(), which doesn't implement the boundary-pixel-control bits (2-5) either style sets */
+#define DRAW_HAIRLINE_THICKNESS      (Draw_OSUnit / 4)      /* R4=0 ("hairline") is approximated as a thin filled stroke rather than true 1-pixel-wide boundary plotting */
+#define FILL_SCANLINE_STEP           (Draw_OSUnit)          /* fill()'s scanline granularity - one scanline per OS unit row, matching module_hline()'s own OS_Plot conversion; no direct SWI equivalent */
+
+/* Scratch buffer sizing for intermediate pipeline stages. Dashing and
+ * thickening can each expand a path considerably (every line becomes an
+ * offset pair plus joins), so a fixed multiplier with a floor comfortably
+ * covers realistic paths without needing an exact prediction - see
+ * AGENTS.md for why this is a plain malloc()/free() per stage rather than
+ * a fixed static workspace or a probe-then-exact-allocate pass. */
+#define SCRATCH_MULTIPLIER (8)
+#define SCRATCH_MINIMUM    (1024)
+#define PLACEHOLDER_SIZE   (8) /* bytes occupied by an EndPath element */
+
+
+/***************************************************************************
+ * Function:     path_byte_size
+ * Description:  Walk a path to find its total byte length, including its
+ *               terminating EndPath element
+ * Parameters:   path-> the path to measure
+ * Returns:      total bytes from path's start up to and including its
+ *               EndPath element
+ **************************************************************************/
+static uint32_t path_byte_size(Draw_PathElement *path)
+{
+    Draw_PathElement *start = path;
+
+    while (path->tag != Draw_EndPath)
+        path = advance_element(path);
+
+    return (uint32_t)(((uint8_t *)path) - ((uint8_t *)start)) + PLACEHOLDER_SIZE;
+}
+
+/***************************************************************************
+ * Function:     scratch_alloc
+ * Description:  Allocate a scratch output path buffer, generously sized
+ *               relative to hint_bytes (the byte size of whatever feeds
+ *               this stage), and initialise its placeholder EndPath
+ * Parameters:   hint_bytes = byte size of the input feeding this stage
+ * Returns:      a malloc()'d buffer ready for path_writer_init(), or NULL
+ *               on allocation failure
+ **************************************************************************/
+static Draw_PathElement *scratch_alloc(uint32_t hint_bytes)
+{
+    uint32_t capacity = hint_bytes * SCRATCH_MULTIPLIER;
+    Draw_PathElement *buf;
+
+    if (capacity < SCRATCH_MINIMUM)
+        capacity = SCRATCH_MINIMUM;
+
+    buf = (Draw_PathElement *)malloc(capacity);
+    if (buf == NULL)
+        return NULL;
+
+    buf->tag = Draw_EndPath;
+    buf->data.end_path = (int32_t)(capacity - PLACEHOLDER_SIZE);
+    return buf;
+}
+
+/***************************************************************************
+ * Function:     find_endpath
+ * Description:  Walk a path from its start to find its EndPath terminator -
+ *               what most Draw SWIs return in R0 when given a real output
+ *               buffer
+ * Parameters:   outpath-> the path to search
+ * Returns:      pointer to its EndPath element
+ **************************************************************************/
+static Draw_PathElement *find_endpath(Draw_PathElement *outpath)
+{
+    while (outpath->tag != Draw_EndPath)
+        outpath = advance_element(outpath);
+    return outpath;
+}
+
+/***************************************************************************
+ * Function:     deliver_path
+ * Description:  Deliver a finished path to the caller, following the
+ *               standard "R1/R7 = 0 means report the size needed, a
+ *               pointer means write there" SWI convention
+ * Parameters:   result-> the finished path
+ *               owns_result = whether result was malloc()'d by us (and so
+ *                             must be free()'d here) - false when result is
+ *                             still the caller's own input, untouched
+ *                             because no stage actually ran
+ *               caller_outpath-> the caller's output buffer, or NULL to
+ *                                report the required size instead
+ *               regs-> the SWI register block, for R0
+ * Returns:      NULL on success, or an error if caller_outpath was too
+ *               small (result is always freed, on every path)
+ **************************************************************************/
+static _kernel_oserror *deliver_path(Draw_PathElement *result, int owns_result,
+                                      Draw_PathElement *caller_outpath, _kernel_swi_regs *regs)
+{
+    uint32_t needed;
+
+    if (result == NULL)
+        return err_DrawPathFull;
+
+    needed = path_byte_size(result);
+
+    if (caller_outpath == NULL)
+    {
+        regs->r[0] = (int)needed;
+        if (owns_result)
+            free(result);
+        return NULL;
+    }
+
+    {
+        uint32_t capacity = (uint32_t)(sizeof(int32_t) * 2) + (uint32_t)caller_outpath->data.end_path;
+
+        if (needed > capacity)
+        {
+            if (owns_result)
+                free(result);
+            return err_DrawPathFull;
+        }
+
+        memcpy(caller_outpath, result, needed);
+        if (owns_result)
+            free(result);
+        regs->r[0] = (int)find_endpath(caller_outpath);
+        return NULL;
+    }
+}
+
+/***************************************************************************
+ * Function:     run_pipeline
+ * Description:  Run flatten -> dash (if a pattern is given) -> thicken/cap
+ *               (if do_thicken) -> transform (if a matrix is given) on
+ *               path, each stage's output malloc()'d fresh and the
+ *               previous stage's buffer freed as soon as it's consumed.
+ *               This is the shared engine behind Draw_Fill, Draw_Stroke
+ *               and Draw_StrokePath - which differ only in what they do
+ *               with the result (render it, or hand it back as a path)
+ * Parameters:   path-> the input path
+ *               flatness = flattening tolerance, or 0 for the default
+ *               dash_pattern-> a dash pattern to apply, or NULL
+ *               do_thicken = whether to thicken/cap the path at all
+ *               thickness = line thickness, or 0 for the hairline default
+ *                           (only meaningful if do_thicken)
+ *               style-> cap/join style, or NULL for plain butt caps
+ *               trfm-> a transformation matrix to apply, or NULL
+ * Returns:      a newly malloc()'d final path (caller must free it), or
+ *               NULL if any stage failed (its own scratch buffers are
+ *               already freed in that case)
+ **************************************************************************/
+static Draw_PathElement *run_pipeline(Draw_Path *path, int32_t flatness,
+                                       Draw_DashPattern *dash_pattern,
+                                       int do_thicken, int32_t thickness, Draw_LineStyle *style,
+                                       OS_Trfm *trfm)
+{
+    Draw_PathElement *cur;
+    Draw_PathElement *scratch;
+    int32_t result;
+
+    if (flatness == 0)
+        flatness = DRAW_DEFAULT_FLATNESS;
+
+    scratch = scratch_alloc(path_byte_size((Draw_PathElement *)path));
+    if (scratch == NULL)
+        return NULL;
+    result = flatten((Draw_PathElement *)path, scratch, flatness);
+    if (result < 0)
+    {
+        free(scratch);
+        return NULL;
+    }
+    cur = scratch;
+
+    if (dash_pattern != NULL)
+    {
+        scratch = scratch_alloc(path_byte_size(cur));
+        if (scratch == NULL)
+        {
+            free(cur);
+            return NULL;
+        }
+        result = dash(cur, scratch, dash_pattern);
+        free(cur);
+        if (result < 0)
+        {
+            free(scratch);
+            return NULL;
+        }
+        cur = scratch;
+    }
+
+    if (do_thicken)
+    {
+        int32_t use_thickness = (thickness == 0) ? DRAW_HAIRLINE_THICKNESS : thickness;
+
+        scratch = scratch_alloc(path_byte_size(cur));
+        if (scratch == NULL)
+        {
+            free(cur);
+            return NULL;
+        }
+        result = (style != NULL) ? cap(cur, scratch, use_thickness, style)
+                                  : thicken(cur, scratch, use_thickness);
+        free(cur);
+        if (result < 0)
+        {
+            free(scratch);
+            return NULL;
+        }
+        cur = scratch;
+    }
+
+    if (trfm != NULL)
+    {
+        scratch = scratch_alloc(path_byte_size(cur));
+        if (scratch == NULL)
+        {
+            free(cur);
+            return NULL;
+        }
+        result = transform(cur, scratch, trfm);
+        free(cur);
+        if (result < 0)
+        {
+            free(scratch);
+            return NULL;
+        }
+        cur = scratch;
+    }
+
+    return cur;
+}
+
+/***************************************************************************
+ * Function:     module_hline
+ * Description:  Fill_Render hline callback: plot one horizontal run with
+ *               OS_Plot. The path coordinates by this point are still in
+ *               Draw's internal units (Draw_OSUnit = 256 per OS unit,
+ *               regardless of any transform() applied - the transform
+ *               matrix only ever maps between internal-unit spaces, per
+ *               its own documented translation convention of "multiply OS
+ *               unit offset by 256"), so this is the one place that
+ *               converts down to the OS units OS_Plot itself expects
+ * Parameters:   ctx = unused
+ *               x0, y, x1 = the run to plot, in Draw internal units
+ * Returns:      none
+ **************************************************************************/
+static void module_hline(void *ctx, int32_t x0, int32_t y, int32_t x1)
+{
+    _swix(OS_Plot, _INR(0,2), 4, x0 / Draw_OSUnit, y / Draw_OSUnit);
+    _swix(OS_Plot, _INR(0,2), 5, x1 / Draw_OSUnit, y / Draw_OSUnit);
+}
+
+/***************************************************************************
+ * Function:     module_polyhline
+ * Description:  Fill_Render polyhline callback: plot every run on a
+ *               scanline via module_hline() in turn
+ * Parameters:   ctx-> unused
+ *               lines-> the runs to plot
+ *               count = number of runs
+ * Returns:      none
+ **************************************************************************/
+static void module_polyhline(void *ctx, const Fill_HLine *lines, int32_t count)
+{
+    int32_t i;
+    for (i = 0; i < count; i++)
+        module_hline(ctx, lines[i].x0, lines[i].y, lines[i].x1);
+}
 
 
 /***************************************************************************
@@ -81,7 +360,6 @@ _kernel_oserror *Mod_Final(int fatal, int podule_base, void *pw)
  **************************************************************************/
 _kernel_oserror *SWI_ProcessPath(int number, _kernel_swi_regs *regs, void *pw)
 {
-    _kernel_oserror *err = NULL;
     /*
      * Draw_ProcessPath - Main Draw SWI
      *
@@ -105,13 +383,136 @@ _kernel_oserror *SWI_ProcessPath(int number, _kernel_swi_regs *regs, void *pw)
     Draw_LineStyle *line_style = (Draw_LineStyle *)regs->r[5];
     Draw_DashPattern *dash_pattern = (Draw_DashPattern *)regs->r[6];
     Draw_OutputPath processed_path = (Draw_OutputPath)regs->r[7];
-    /* Output registers */
-    void * end_or_used;
+    int32_t r7 = (int32_t)regs->r[7];
 
-    /* FIXME: SWI not yet implemented */
+    Draw_PathElement *cur = (Draw_PathElement *)path;
+    Draw_PathElement *scratch;
+    int32_t result;
+    int owns_cur = 0;
 
-    regs->r[0] = (int)end_or_used;  // &.Data
-    return err;
+    /* R7 = 1 or 2 (VDU output, subpath-by-subpath or not) are explicitly
+     * unsupported by Draw_ProcessPath itself, per the PRM ("This call is
+     * also unable to handle R7 = 1 or 2"). R7 = &80000000+ptr (bounding
+     * box output) is a separate gap - not implemented here. */
+    if (r7 == 1 || r7 == 2 || (r7 & (int32_t)0x80000000) != 0)
+        return err_DrawUnimplementedDraw;
+
+    /* Step 1 (bit 27, "close open subpaths") is not implemented as a
+     * distinct pass - fill() already closes every subpath implicitly for
+     * winding purposes, which covers the common case of processing towards
+     * a fill, but a dedicated close-subpaths step for other R7 output
+     * modes is a known gap (see AGENTS.md). */
+
+    if (fill_style & Draw_FillFlatten)
+    {
+        if (flatness == 0)
+            flatness = DRAW_DEFAULT_FLATNESS;
+        scratch = scratch_alloc(path_byte_size(cur));
+        if (scratch == NULL)
+            return err_DrawPathFull;
+        result = flatten(cur, scratch, flatness);
+        if (owns_cur)
+            free(cur);
+        if (result < 0)
+        {
+            free(scratch);
+            return err_DrawPathFull;
+        }
+        cur = scratch;
+        owns_cur = 1;
+    }
+
+    if (dash_pattern != NULL)
+    {
+        scratch = scratch_alloc(path_byte_size(cur));
+        if (scratch == NULL)
+        {
+            if (owns_cur)
+                free(cur);
+            return err_DrawPathFull;
+        }
+        result = dash(cur, scratch, dash_pattern);
+        if (owns_cur)
+            free(cur);
+        if (result < 0)
+        {
+            free(scratch);
+            return err_DrawPathFull;
+        }
+        cur = scratch;
+        owns_cur = 1;
+    }
+
+    if (fill_style & Draw_FillThicken)
+    {
+        int32_t use_thickness = (thickness == 0) ? DRAW_HAIRLINE_THICKNESS : thickness;
+
+        scratch = scratch_alloc(path_byte_size(cur));
+        if (scratch == NULL)
+        {
+            if (owns_cur)
+                free(cur);
+            return err_DrawPathFull;
+        }
+        result = (line_style != NULL) ? cap(cur, scratch, use_thickness, line_style)
+                                       : thicken(cur, scratch, use_thickness);
+        if (owns_cur)
+            free(cur);
+        if (result < 0)
+        {
+            free(scratch);
+            return err_DrawPathFull;
+        }
+        cur = scratch;
+        owns_cur = 1;
+    }
+
+    /* Re-flatten after thickening (bit 30) is a no-op here: round caps and
+     * joins are already emitted as straight segments rather than curves
+     * (see AGENTS.md's "round caps are polygon approximations" caveat),
+     * so there is nothing left needing a second flatten pass. */
+
+    if (trfm != NULL)
+    {
+        scratch = scratch_alloc(path_byte_size(cur));
+        if (scratch == NULL)
+        {
+            if (owns_cur)
+                free(cur);
+            return err_DrawPathFull;
+        }
+        result = transform(cur, scratch, trfm);
+        if (owns_cur)
+            free(cur);
+        if (result < 0)
+        {
+            free(scratch);
+            return err_DrawPathFull;
+        }
+        cur = scratch;
+        owns_cur = 1;
+    }
+
+    if (r7 == 3)
+    {
+        regs->r[0] = (int)path_byte_size(cur);
+        if (owns_cur)
+            free(cur);
+        return NULL;
+    }
+
+    if (r7 == 0)
+    {
+        /* Output to the input path buffer, in place - only valid when the
+         * path's storage requirement doesn't change (eg transform-only).
+         * Not implemented: our stages always assume separate input/output
+         * buffers. */
+        if (owns_cur)
+            free(cur);
+        return err_DrawUnimplementedDraw;
+    }
+
+    return deliver_path(cur, owns_cur, (Draw_PathElement *)processed_path, regs);
 }
 
 
@@ -129,7 +530,6 @@ _kernel_oserror *SWI_ProcessPath(int number, _kernel_swi_regs *regs, void *pw)
  **************************************************************************/
 _kernel_oserror *SWI_Fill(int number, _kernel_swi_regs *regs, void *pw)
 {
-    _kernel_oserror *err = NULL;
     /*
      * Draw_Fill - Processes a path and sends it to the VDU, filling the interior portion
      *
@@ -145,9 +545,23 @@ _kernel_oserror *SWI_Fill(int number, _kernel_swi_regs *regs, void *pw)
     OS_Trfm *trfm = (OS_Trfm *)regs->r[2];
     int32_t flatness = (int32_t)regs->r[3];
 
-    /* FIXME: SWI not yet implemented */
+    Draw_PathElement *result;
+    Fill_Render render;
 
-    return err;
+    if (fill_style == 0)
+        fill_style = DRAW_DEFAULT_FILLSTYLE;
+
+    result = run_pipeline(path, flatness, NULL, 0, 0, NULL, trfm);
+    if (result == NULL)
+        return err_DrawPathFull;
+
+    render.ctx = NULL;
+    render.hline = module_hline;
+    render.polyhline = module_polyhline;
+    fill(result, fill_style, FILL_SCANLINE_STEP, &render);
+
+    free(result);
+    return NULL;
 }
 
 
@@ -165,7 +579,6 @@ _kernel_oserror *SWI_Fill(int number, _kernel_swi_regs *regs, void *pw)
  **************************************************************************/
 _kernel_oserror *SWI_Stroke(int number, _kernel_swi_regs *regs, void *pw)
 {
-    _kernel_oserror *err = NULL;
     /*
      * Draw_Stroke - Processes a path and sends it to the VDU
      *
@@ -187,9 +600,23 @@ _kernel_oserror *SWI_Stroke(int number, _kernel_swi_regs *regs, void *pw)
     Draw_LineStyle *line_style = (Draw_LineStyle *)regs->r[5];
     Draw_DashPattern *dash_pattern = (Draw_DashPattern *)regs->r[6];
 
-    /* FIXME: SWI not yet implemented */
+    Draw_PathElement *result;
+    Fill_Render render;
 
-    return err;
+    if (fill_style == 0)
+        fill_style = (thickness != 0) ? DRAW_DEFAULT_FILLSTYLE : DRAW_DEFAULT_FILLSTYLE_THIN;
+
+    result = run_pipeline(path, flatness, dash_pattern, 1, thickness, line_style, trfm);
+    if (result == NULL)
+        return err_DrawPathFull;
+
+    render.ctx = NULL;
+    render.hline = module_hline;
+    render.polyhline = module_polyhline;
+    fill(result, fill_style, FILL_SCANLINE_STEP, &render);
+
+    free(result);
+    return NULL;
 }
 
 
@@ -207,7 +634,6 @@ _kernel_oserror *SWI_Stroke(int number, _kernel_swi_regs *regs, void *pw)
  **************************************************************************/
 _kernel_oserror *SWI_StrokePath(int number, _kernel_swi_regs *regs, void *pw)
 {
-    _kernel_oserror *err = NULL;
     /*
      * Draw_StrokePath - Processes a path and writes its output to another path
      *
@@ -229,13 +655,11 @@ _kernel_oserror *SWI_StrokePath(int number, _kernel_swi_regs *regs, void *pw)
     int32_t thickness = (int32_t)regs->r[4];
     Draw_LineStyle *line_style = (Draw_LineStyle *)regs->r[5];
     Draw_DashPattern *dash_pattern = (Draw_DashPattern *)regs->r[6];
-    /* Output registers */
-    void * end_or_used;
 
-    /* FIXME: SWI not yet implemented */
+    Draw_PathElement *result = run_pipeline(path, flatness, dash_pattern, 1, thickness,
+                                             line_style, trfm);
 
-    regs->r[0] = (int)end_or_used;  // &.Data
-    return err;
+    return deliver_path(result, 1, (Draw_PathElement *)stroked_path, regs);
 }
 
 
@@ -253,7 +677,6 @@ _kernel_oserror *SWI_StrokePath(int number, _kernel_swi_regs *regs, void *pw)
  **************************************************************************/
 _kernel_oserror *SWI_FlattenPath(int number, _kernel_swi_regs *regs, void *pw)
 {
-    _kernel_oserror *err = NULL;
     /*
      * Draw_FlattenPath - Flattens a path and writes its output to another path
      *
@@ -267,13 +690,25 @@ _kernel_oserror *SWI_FlattenPath(int number, _kernel_swi_regs *regs, void *pw)
     Draw_Path *path = (Draw_Path *)regs->r[0];
     Draw_Path * flattened_path = (Draw_Path *)regs->r[1];
     int32_t flatness = (int32_t)regs->r[2];
-    /* Output registers */
-    void * end_or_used;
 
-    /* FIXME: SWI not yet implemented */
+    Draw_PathElement *scratch;
+    int32_t result;
 
-    regs->r[0] = (int)end_or_used;  // &.Data
-    return err;
+    if (flatness == 0)
+        flatness = DRAW_DEFAULT_FLATNESS;
+
+    scratch = scratch_alloc(path_byte_size((Draw_PathElement *)path));
+    if (scratch == NULL)
+        return err_DrawPathFull;
+
+    result = flatten((Draw_PathElement *)path, scratch, flatness);
+    if (result < 0)
+    {
+        free(scratch);
+        return err_DrawPathFull;
+    }
+
+    return deliver_path(scratch, 1, (Draw_PathElement *)flattened_path, regs);
 }
 
 
@@ -291,7 +726,6 @@ _kernel_oserror *SWI_FlattenPath(int number, _kernel_swi_regs *regs, void *pw)
  **************************************************************************/
 _kernel_oserror *SWI_TransformPath(int number, _kernel_swi_regs *regs, void *pw)
 {
-    _kernel_oserror *err = NULL;
     /*
      * Draw_TransformPath - Transforms a path and writes its output to another path
      *
@@ -307,13 +741,26 @@ _kernel_oserror *SWI_TransformPath(int number, _kernel_swi_regs *regs, void *pw)
     Draw_Path * transformed_path = (Draw_Path *)regs->r[1];
     OS_Trfm *trfm = (OS_Trfm *)regs->r[2];
     /* R3 is 0 */
-    /* Output registers */
-    void * end_or_used;
 
-    /* FIXME: SWI not yet implemented */
+    static const OS_Trfm identity_trfm = { { {0x10000, 0}, {0, 0x10000}, {0, 0} } };
+    Draw_PathElement *scratch;
+    int32_t result;
 
-    regs->r[0] = (int)end_or_used;  // &.Data
-    return err;
+    if (trfm == NULL)
+        trfm = (OS_Trfm *)&identity_trfm;
+
+    scratch = scratch_alloc(path_byte_size((Draw_PathElement *)path));
+    if (scratch == NULL)
+        return err_DrawPathFull;
+
+    result = transform((Draw_PathElement *)path, scratch, trfm);
+    if (result < 0)
+    {
+        free(scratch);
+        return err_DrawPathFull;
+    }
+
+    return deliver_path(scratch, 1, (Draw_PathElement *)transformed_path, regs);
 }
 
 
@@ -331,7 +778,6 @@ _kernel_oserror *SWI_TransformPath(int number, _kernel_swi_regs *regs, void *pw)
  **************************************************************************/
 _kernel_oserror *SWI_FillClipped(int number, _kernel_swi_regs *regs, void *pw)
 {
-    _kernel_oserror *err = NULL;
     /*
      * Draw_FillClipped - Processes a path and sends it to the VDU, filling the interior portion and clipping against the clip descriptor - RISC OS 5+
      *
@@ -342,16 +788,8 @@ _kernel_oserror *SWI_FillClipped(int number, _kernel_swi_regs *regs, void *pw)
      *     R4 -> clip_descriptor
      */
 
-    /* Input registers */
-    Draw_Path *path = (Draw_Path *)regs->r[0];
-    Draw_FillStyle fill_style = (Draw_FillStyle)regs->r[1];
-    OS_Trfm *trfm = (OS_Trfm *)regs->r[2];
-    int32_t flatness = (int32_t)regs->r[3];
-    Draw_ClipDescriptor *clip_descriptor = (Draw_ClipDescriptor *)regs->r[4];
-
-    /* FIXME: SWI not yet implemented */
-
-    return err;
+    /* Not implemented: clipping is out of scope for this pass. */
+    return err_DrawUnimplementedDraw;
 }
 
 
@@ -369,7 +807,6 @@ _kernel_oserror *SWI_FillClipped(int number, _kernel_swi_regs *regs, void *pw)
  **************************************************************************/
 _kernel_oserror *SWI_StrokeClipped(int number, _kernel_swi_regs *regs, void *pw)
 {
-    _kernel_oserror *err = NULL;
     /*
      * Draw_StrokeClipped - Processes a path and sends it to the VDU after clipping against the clip descriptor - RISC OS 5+
      *
@@ -383,18 +820,6 @@ _kernel_oserror *SWI_StrokeClipped(int number, _kernel_swi_regs *regs, void *pw)
      *     R7 -> clip_descriptor
      */
 
-    /* Input registers */
-    Draw_Path *path = (Draw_Path *)regs->r[0];
-    Draw_FillStyle fill_style = (Draw_FillStyle)regs->r[1];
-    OS_Trfm *trfm = (OS_Trfm *)regs->r[2];
-    int32_t flatness = (int32_t)regs->r[3];
-    int32_t thickness = (int32_t)regs->r[4];
-    Draw_LineStyle *line_style = (Draw_LineStyle *)regs->r[5];
-    Draw_DashPattern *dash_pattern = (Draw_DashPattern *)regs->r[6];
-    Draw_ClipDescriptor *clip_descriptor = (Draw_ClipDescriptor *)regs->r[7];
-
-    /* FIXME: SWI not yet implemented */
-
-    return err;
+    /* Not implemented: clipping is out of scope for this pass. */
+    return err_DrawUnimplementedDraw;
 }
-

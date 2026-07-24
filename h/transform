@@ -1,0 +1,32 @@
+/*******************************************************************
+ * File:     transform
+ * Purpose:  Applying a transformation matrix to every coordinate in a
+ *           Draw path
+ * Author:   Gerph
+ * Date:     24 Jul 2026
+ ******************************************************************/
+
+#ifndef TRANSFORM_H
+#define TRANSFORM_H
+
+#include "types.h"
+
+/*************************************************** Gerph *********
+ Function:      transform
+ Description:   Apply a transformation matrix to every coordinate in
+                inpath - x' = a.x + c.y + e, y' = b.x + d.y + f, per the
+                Draw module's own transform formula - writing the result to
+                outpath. Unlike the other pipeline stages, inpath does not
+                need to be flattened first: BezierTo control points and
+                endpoints are all transformed too, and the tag (including
+                whether a MoveTo is a SpecialMoveTo) is preserved exactly
+ Parameters:    inpath-> source path (read-only)
+                outpath-> output buffer, initially holding a single EndPath
+                          whose end_path field contains the number of bytes
+                          available after it
+                trfm-> the transformation matrix to apply
+ Returns:       the standard RISC OS space-report - see path_write_result()
+ ******************************************************************/
+int32_t transform(Draw_PathElement *inpath, Draw_PathElement *outpath, OS_Trfm *trfm);
+
+#endif

@@ -44,6 +44,7 @@ CDEFINES   =
 # so the two builds never clash even though the sources are shared.
 OBJS       = 			 \
              o.module \
+             o.modhead \
              o.bufferdata \
              o.geometry \
              o.pathio \
@@ -52,6 +53,7 @@ OBJS       = 			 \
              o.cap \
              o.dash \
              o.fill \
+             o.transform \
 
 
 include CModule
