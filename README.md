@@ -1,6 +1,7 @@
 # Draw
 
-This repository is a from-scratch C implementation of the RISC OS Draw module.
+This repository is a from-scratch C stub implementation of the RISC OS Draw
+module.
 It implements the Draw path-processing pipeline, including curve flattening,
 dashing, stroke thickening and caps, transformations, and scanline filling.
 
